@@ -4,170 +4,58 @@
     <Natvis Include="$(SolutionDir)tools\ConsoleTypes.natvis" />
   </ItemGroup>
   <ItemGroup>
-    <PRIResource Include="../Resources/en-US/Resources.resw" />
+    <ApplicationDefinition Include="..\App.xaml" />
   </ItemGroup>
   <ItemGroup>
-    <ClCompile Include="../init.cpp" />
+    <ClCompile Include="../Tab.cpp" />
+    <ClCompile Include="../Pane.cpp" />
+    <ClCompile Include="../ColorScheme.cpp" />
+    <ClCompile Include="../GlobalAppSettings.cpp" />
+    <ClCompile Include="../Profile.cpp" />
+    <ClCompile Include="../CascadiaSettings.cpp" />
+    <ClCompile Include="../CascadiaSettingsSerialization.cpp" />
+    <ClCompile Include="../AppKeyBindingsSerialization.cpp" />
+    <ClCompile Include="../KeyChordSerialization.cpp" />
     <ClCompile Include="../Utils.cpp" />
     <ClCompile Include="pch.cpp" />
+    <ClCompile Include="$(OpenConsoleDir)\dep\jsoncpp\jsoncpp.cpp" />
     <ClCompile Include="$(GeneratedFilesDir)module.g.cpp" />
-    <ClCompile Include="../AzureCloudShellGenerator.cpp">
-      <Filter>profileGeneration</Filter>
-    </ClCompile>
-    <ClCompile Include="../PowershellCoreProfileGenerator.cpp">
-      <Filter>profileGeneration</Filter>
-    </ClCompile>
-    <ClCompile Include="../WslDistroGenerator.cpp">
-      <Filter>profileGeneration</Filter>
-    </ClCompile>
-    <ClCompile Include="../AppKeyBindingsSerialization.cpp">
-      <Filter>settings</Filter>
-    </ClCompile>
-    <ClCompile Include="../CascadiaSettings.cpp">
-      <Filter>settings</Filter>
-    </ClCompile>
-    <ClCompile Include="../CascadiaSettingsSerialization.cpp">
-      <Filter>settings</Filter>
-    </ClCompile>
-    <ClCompile Include="../GlobalAppSettings.cpp">
-      <Filter>settings</Filter>
-    </ClCompile>
-    <ClCompile Include="../KeyChordSerialization.cpp">
-      <Filter>settings</Filter>
-    </ClCompile>
-    <ClCompile Include="../Profile.cpp">
-      <Filter>settings</Filter>
-    </ClCompile>
-    <ClCompile Include="../ColorScheme.cpp">
-      <Filter>settings</Filter>
-    </ClCompile>
-    <ClCompile Include="../Pane.cpp">
-      <Filter>pane</Filter>
-    </ClCompile>
-    <ClCompile Include="../DefaultProfileUtils.cpp">
-      <Filter>profileGeneration</Filter>
-    </ClCompile>
-    <ClCompile Include="$(OpenConsoleDir)\dep\jsoncpp\jsoncpp.cpp">
-      <Filter>json</Filter>
-    </ClCompile>
-    <ClCompile Include="../JsonUtils.cpp">
-      <Filter>json</Filter>
-    </ClCompile>
-    <ClCompile Include="../Tab.cpp">
-      <Filter>tab</Filter>
-    </ClCompile>
-    <ClCompile Include="../Pane.LayoutSizeNode.cpp">
-      <Filter>pane</Filter>
-    </ClCompile>
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="../App.base.h" />
+    <ClInclude Include="../Tab.h" />
+    <ClInclude Include="../Pane.h" />
+    <ClInclude Include="../ColorScheme.h" />
+    <ClInclude Include="../GlobalAppSettings.h" />
+    <ClInclude Include="../Profile.h" />
+    <ClInclude Include="../CascadiaSettings.h" />
+    <ClInclude Include="../AppKeyBindingsSerialization.h" />
+    <ClInclude Include="../KeyChordSerialization.h" />
     <ClInclude Include="../Utils.h" />
-    <ClInclude Include="../TerminalWarnings.h" />
     <ClInclude Include="pch.h" />
-    <ClInclude Include="../App.base.h">
-      <Filter>app</Filter>
-    </ClInclude>
-    <ClInclude Include="../AzureCloudShellGenerator.h">
-      <Filter>profileGeneration</Filter>
-    </ClInclude>
-    <ClInclude Include="../IDynamicProfileGenerator.h">
-      <Filter>profileGeneration</Filter>
-    </ClInclude>
-    <ClInclude Include="../PowershellCoreProfileGenerator.h">
-      <Filter>profileGeneration</Filter>
-    </ClInclude>
-    <ClInclude Include="../WslDistroGenerator.h">
-      <Filter>profileGeneration</Filter>
-    </ClInclude>
-    <ClInclude Include="../CascadiaSettings.h">
-      <Filter>settings</Filter>
-    </ClInclude>
-    <ClInclude Include="../GlobalAppSettings.h">
-      <Filter>settings</Filter>
-    </ClInclude>
-    <ClInclude Include="../KeyChordSerialization.h">
-      <Filter>settings</Filter>
-    </ClInclude>
-    <ClInclude Include="../Profile.h">
-      <Filter>settings</Filter>
-    </ClInclude>
-    <ClInclude Include="../ColorScheme.h">
-      <Filter>settings</Filter>
-    </ClInclude>
-    <ClInclude Include="../Pane.h">
-      <Filter>pane</Filter>
-    </ClInclude>
-    <ClInclude Include="../DefaultProfileUtils.h">
-      <Filter>profileGeneration</Filter>
-    </ClInclude>
-    <ClInclude Include="../JsonUtils.h">
-      <Filter>json</Filter>
-    </ClInclude>
-    <ClInclude Include="../Tab.h">
-      <Filter>tab</Filter>
-    </ClInclude>
-    <ClInclude Include="../TelnetGenerator.h" />
+    <ClInclude Include="../AppKeyBindings.h" />
   </ItemGroup>
   <ItemGroup>
-    <Midl Include="../AppLogic.idl">
-      <Filter>app</Filter>
-    </Midl>
-    <Midl Include="../ActionArgs.idl">
-      <Filter>settings</Filter>
-    </Midl>
-    <Midl Include="../AppKeyBindings.idl">
-      <Filter>settings</Filter>
-    </Midl>
-    <Midl Include="../ShortcutActionDispatch.idl">
-      <Filter>settings</Filter>
-    </Midl>
-    <Midl Include="../Tab.idl">
-      <Filter>tab</Filter>
-    </Midl>
+    <Midl Include="../AppKeyBindings.idl" />
   </ItemGroup>
   <ItemGroup>
     <None Include="../packages.config" />
+    <None Include="packages.config" />
   </ItemGroup>
   <ItemGroup>
-    <Page Include="../MinMaxCloseControl.xaml">
-      <Filter>controls</Filter>
-    </Page>
-    <Page Include="../TabRowControl.xaml">
-      <Filter>controls</Filter>
-    </Page>
-    <Page Include="../TerminalPage.xaml">
-      <Filter>controls</Filter>
-    </Page>
-    <Page Include="../TitlebarControl.xaml">
-      <Filter>controls</Filter>
-    </Page>
+    <Page Include="../MinMaxCloseControl.xaml" />
+    <Page Include="../TerminalPage.xaml" />
+    <Page Include="../TitlebarControl.xaml" />
+    <Page Include="../TabRowControl.xaml" />
+    <Page Include="../SettingsPage.xaml" />
+    <Page Include="GlobalSettingsContent.xaml" />
+    <Page Include="ProfilesSettingsContent.xaml" />
+    <Page Include="ColorSchemesSettingsContent.xaml" />
+    <Page Include="KeybindingsSettingsContent.xaml" />
   </ItemGroup>
   <ItemGroup>
-    <Filter Include="app">
-      <UniqueIdentifier>{21588d0a-fa81-4306-828d-c095af895b9e}</UniqueIdentifier>
+    <Filter Include="SettingsContent">
+      <UniqueIdentifier>{40098f39-a747-43da-a6b6-95e290c7c268}</UniqueIdentifier>
     </Filter>
-    <Filter Include="profileGeneration">
-      <UniqueIdentifier>{c81be61b-0d58-4277-8fd1-fcc888c3da9c}</UniqueIdentifier>
-    </Filter>
-    <Filter Include="settings">
-      <UniqueIdentifier>{27ff86d8-2a62-4787-b55a-2ec1db32abec}</UniqueIdentifier>
-    </Filter>
-    <Filter Include="pane">
-      <UniqueIdentifier>{65477024-2ce1-4c53-8f30-5d68f3af3981}</UniqueIdentifier>
-    </Filter>
-    <Filter Include="controls">
-      <UniqueIdentifier>{2455d67b-17ef-4cdd-ad9e-eb8ec4412e03}</UniqueIdentifier>
-    </Filter>
-    <Filter Include="json">
-      <UniqueIdentifier>{81a6314f-aa5b-4533-a499-13bc3a5c4af0}</UniqueIdentifier>
-    </Filter>
-    <Filter Include="tab">
-      <UniqueIdentifier>{6d40e12f-b83f-462e-8f93-fa421f87b27e}</UniqueIdentifier>
-    </Filter>
-  </ItemGroup>
-  <ItemGroup>
-    <ApplicationDefinition Include="..\App.xaml">
-      <Filter>app</Filter>
-    </ApplicationDefinition>
   </ItemGroup>
 </Project>

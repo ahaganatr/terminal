@@ -37,8 +37,7 @@ public:
 #pragma region IRenderData
     const TextAttribute GetDefaultBrushColors() noexcept override;
 
-    const COLORREF GetForegroundColor(const TextAttribute& attr) const noexcept override;
-    const COLORREF GetBackgroundColor(const TextAttribute& attr) const noexcept override;
+    std::pair<COLORREF, COLORREF> GetAttributeColors(const TextAttribute& attr) const noexcept override;
 
     COORD GetCursorPosition() const noexcept override;
     bool IsCursorVisible() const noexcept override;
@@ -49,19 +48,25 @@ public:
     COLORREF GetCursorColor() const noexcept override;
     bool IsCursorDoubleWidth() const noexcept override;
 
+    bool IsScreenReversed() const noexcept override;
+
     const std::vector<Microsoft::Console::Render::RenderOverlay> GetOverlays() const noexcept override;
 
     const bool IsGridLineDrawingAllowed() noexcept override;
 
     const std::wstring GetConsoleTitle() const noexcept override;
+
+    const std::wstring GetHyperlinkUri(uint16_t id) const noexcept override;
+    const std::wstring GetHyperlinkCustomId(uint16_t id) const noexcept override;
 #pragma endregion
 
 #pragma region IUiaData
     const bool IsSelectionActive() const override;
+    const bool IsBlockSelection() const noexcept override;
     void ClearSelection() override;
     void SelectNewRegion(const COORD coordStart, const COORD coordEnd) override;
     const COORD GetSelectionAnchor() const noexcept;
-    const COORD GetEndSelectionPosition() const noexcept;
+    const COORD GetSelectionEnd() const noexcept;
     void ColorSelection(const COORD coordSelectionStart, const COORD coordSelectionEnd, const TextAttribute attr);
 #pragma endregion
 };

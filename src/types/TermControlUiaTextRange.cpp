@@ -27,9 +27,10 @@ HRESULT TermControlUiaTextRange::RuntimeClassInitialize(_In_ IUiaData* pData,
                                                         _In_ IRawElementProviderSimple* const pProvider,
                                                         const COORD start,
                                                         const COORD end,
+                                                        bool blockRange,
                                                         const std::wstring_view wordDelimiters) noexcept
 {
-    return UiaTextRangeBase::RuntimeClassInitialize(pData, pProvider, start, end, wordDelimiters);
+    return UiaTextRangeBase::RuntimeClassInitialize(pData, pProvider, start, end, blockRange, wordDelimiters);
 }
 
 // returns a degenerate text range of the start of the row closest to the y value of point
@@ -79,12 +80,6 @@ IFACEMETHODIMP TermControlUiaTextRange::Clone(_Outptr_result_maybenull_ ITextRan
     return S_OK;
 }
 
-void TermControlUiaTextRange::_ChangeViewport(const SMALL_RECT NewWindow)
-{
-    const gsl::not_null<TermControlUiaProvider*> provider = static_cast<TermControlUiaProvider*>(_pProvider);
-    provider->ChangeViewport(NewWindow);
-}
-
 // Method Description:
 // - Transform coordinates relative to the client to relative to the screen
 // Arguments:
@@ -97,9 +92,10 @@ void TermControlUiaTextRange::_TranslatePointToScreen(LPPOINT clientPoint) const
     const gsl::not_null<TermControlUiaProvider*> provider = static_cast<TermControlUiaProvider*>(_pProvider);
 
     const auto includeOffsets = [](long clientPos, double termControlPos, double padding, double scaleFactor) {
-        auto result = base::ClampedNumeric<double>(clientPos);
-        result += padding;
+        auto result = base::ClampedNumeric<double>(padding);
+        // only the padding is in DIPs now
         result *= scaleFactor;
+        result += clientPos;
         result += termControlPos;
         return result;
     };
@@ -130,10 +126,11 @@ void TermControlUiaTextRange::_TranslatePointFromScreen(LPPOINT screenPoint) con
     const gsl::not_null<TermControlUiaProvider*> provider = static_cast<TermControlUiaProvider*>(_pProvider);
 
     const auto includeOffsets = [](long screenPos, double termControlPos, double padding, double scaleFactor) {
-        auto result = base::ClampedNumeric<double>(screenPos);
-        result -= termControlPos;
+        auto result = base::ClampedNumeric<double>(padding);
+        // only the padding is in DIPs now
         result /= scaleFactor;
-        result -= padding;
+        result -= screenPos;
+        result -= termControlPos;
         return result;
     };
 

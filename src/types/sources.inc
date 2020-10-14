@@ -42,9 +42,9 @@ SOURCES= \
     ..\Utf16Parser.cpp \
     ..\utils.cpp \
     ..\ThemeUtils.cpp \
-    ..\WindowUiaProviderBase.cpp \
     ..\ScreenInfoUiaProviderBase.cpp \
     ..\UiaTextRangeBase.cpp \
+    ..\UiaTracing.cpp \
     ..\TermControlUiaProvider.cpp \
     ..\TermControlUiaTextRange.cpp \
 

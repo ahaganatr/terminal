@@ -33,13 +33,17 @@ TextBuffer::TextBuffer(const COORD screenBufferSize,
     _cursor{ cursorSize, *this },
     _storage{},
     _unicodeStorage{},
-    _renderTarget{ renderTarget }
+    _renderTarget{ renderTarget },
+    _size{},
+    _currentHyperlinkId{ 1 }
 {
     // initialize ROWs
     for (size_t i = 0; i < static_cast<size_t>(screenBufferSize.Y); ++i)
     {
         _storage.emplace_back(static_cast<SHORT>(i), screenBufferSize.X, _currentAttributes, this);
     }
+
+    _UpdateSize();
 }
 
 // Routine Description:
@@ -548,7 +552,10 @@ bool TextBuffer::IncrementCircularBuffer(const bool inVtMode)
     // to the logical position 0 in the window (cursor coordinates and all other coordinates).
     _renderTarget.TriggerCircling();
 
-    // First, clean out the old "first row" as it will become the "last row" of the buffer after the circle is performed.
+    // Prune hyperlinks to delete obsolete references
+    _PruneHyperlinks();
+
+    // Second, clean out the old "first row" as it will become the "last row" of the buffer after the circle is performed.
     auto fillAttributes = _currentAttributes;
     if (inVtMode)
     {
@@ -573,27 +580,21 @@ bool TextBuffer::IncrementCircularBuffer(const bool inVtMode)
 }
 
 //Routine Description:
-// - Retrieves the position of the last non-space character on the final line of the text buffer.
-// - By default, we search the entire buffer to find the last non-space character
-//Arguments:
-// - <none>
-//Return Value:
-// - Coordinate position in screen coordinates (offset coordinates, not array index coordinates).
-COORD TextBuffer::GetLastNonSpaceCharacter() const
-{
-    return GetLastNonSpaceCharacter(GetSize());
-}
-
-//Routine Description:
-// - Retrieves the position of the last non-space character in the given viewport
-// - This is basically an optimized version of GetLastNonSpaceCharacter(), and can be called when
-// - we know the last character is within the given viewport (so we don't need to check the entire buffer)
+// - Retrieves the position of the last non-space character in the given
+//   viewport
+// - By default, we search the entire buffer to find the last non-space
+//   character.
+// - If we know the last character is within the given viewport (so we don't
+//   need to check the entire buffer), we can provide a value in viewOptional
+//   that we'll use to search for the last character in.
 //Arguments:
 // - The viewport
 //Return value:
 // - Coordinate position (relative to the text buffer)
-COORD TextBuffer::GetLastNonSpaceCharacter(const Microsoft::Console::Types::Viewport viewport) const
+COORD TextBuffer::GetLastNonSpaceCharacter(std::optional<const Microsoft::Console::Types::Viewport> viewOptional) const
 {
+    const auto viewport = viewOptional.has_value() ? viewOptional.value() : GetSize();
+
     COORD coordEndOfText = { 0 };
     // Search the given viewport by starting at the bottom.
     coordEndOfText.Y = viewport.BottomInclusive();
@@ -629,7 +630,7 @@ COORD TextBuffer::GetLastNonSpaceCharacter(const Microsoft::Console::Types::View
 // Return Value:
 // - Coordinate position in screen coordinates of the character just before the cursor.
 // - NOTE: Will return 0,0 if already in the top left corner
-COORD TextBuffer::_GetPreviousFromCursor() const
+COORD TextBuffer::_GetPreviousFromCursor() const noexcept
 {
     COORD coordPosition = GetCursor().GetPosition();
 
@@ -658,9 +659,15 @@ const SHORT TextBuffer::GetFirstRowIndex() const noexcept
 {
     return _firstRow;
 }
-const Viewport TextBuffer::GetSize() const
+
+const Viewport TextBuffer::GetSize() const noexcept
 {
-    return Viewport::FromDimensions({ 0, 0 }, { gsl::narrow<SHORT>(_storage.at(0).size()), gsl::narrow<SHORT>(_storage.size()) });
+    return _size;
+}
+
+void TextBuffer::_UpdateSize()
+{
+    _size = Viewport::FromDimensions({ 0, 0 }, { gsl::narrow<SHORT>(_storage.at(0).size()), gsl::narrow<SHORT>(_storage.size()) });
 }
 
 void TextBuffer::_SetFirstRowIndex(const SHORT FirstRowIndex) noexcept
@@ -784,7 +791,7 @@ const Cursor& TextBuffer::GetCursor() const noexcept
     return _currentAttributes;
 }
 
-void TextBuffer::SetCurrentAttributes(const TextAttribute currentAttributes) noexcept
+void TextBuffer::SetCurrentAttributes(const TextAttribute& currentAttributes) noexcept
 {
     _currentAttributes = currentAttributes;
 }
@@ -851,6 +858,9 @@ void TextBuffer::Reset()
         // Also take advantage of the row ID refresh loop to resize the rows in the X dimension
         // and cleanup the UnicodeStorage characters that might fall outside the resized buffer.
         _RefreshRowIDs(newSize.X);
+
+        // Update the cached size value
+        _UpdateSize();
     }
     CATCH_RETURN();
 
@@ -878,7 +888,7 @@ UnicodeStorage& TextBuffer::GetUnicodeStorage() noexcept
 // - newRowWidth - Optional new value for the row width.
 void TextBuffer::_RefreshRowIDs(std::optional<SHORT> newRowWidth)
 {
-    std::map<SHORT, SHORT> rowMap;
+    std::unordered_map<SHORT, SHORT> rowMap;
     SHORT i = 0;
     for (auto& it : _storage)
     {
@@ -952,6 +962,19 @@ Microsoft::Console::Render::IRenderTarget& TextBuffer::GetRenderTarget() noexcep
 }
 
 // Method Description:
+// - get delimiter class for buffer cell position
+// - used for double click selection and uia word navigation
+// Arguments:
+// - pos: the buffer cell under observation
+// - wordDelimiters: the delimiters defined as a part of the DelimiterClass::DelimiterChar
+// Return Value:
+// - the delimiter class for the given char
+const DelimiterClass TextBuffer::_GetDelimiterClassAt(const COORD pos, const std::wstring_view wordDelimiters) const
+{
+    return GetRowByOffset(pos.Y).GetCharRow().DelimiterClassAt(pos.X, wordDelimiters);
+}
+
+// Method Description:
 // - Get the COORD for the beginning of the word you are on
 // Arguments:
 // - target - a COORD on the word you are currently on
@@ -973,19 +996,29 @@ const COORD TextBuffer::GetWordStart(const COORD target, const std::wstring_view
     //  so the words in the example include ["word   ", "other  "]
     // NOTE: the start anchor (this one) is inclusive, whereas the end anchor (GetWordEnd) is exclusive
 
-    // can't expand left
-    if (target.X == GetSize().Left())
+#pragma warning(suppress : 26496)
+    // GH#7664: Treat EndExclusive as EndInclusive so
+    // that it actually points to a space in the buffer
+    auto copy{ target };
+    const auto bufferSize{ GetSize() };
+    if (target == bufferSize.Origin())
     {
+        // can't expand left
         return target;
+    }
+    else if (target == bufferSize.EndExclusive())
+    {
+        // treat EndExclusive as EndInclusive
+        copy = { bufferSize.RightInclusive(), bufferSize.BottomInclusive() };
     }
 
     if (accessibilityMode)
     {
-        return _GetWordStartForAccessibility(target, wordDelimiters);
+        return _GetWordStartForAccessibility(copy, wordDelimiters);
     }
     else
     {
-        return _GetWordStartForSelection(target, wordDelimiters);
+        return _GetWordStartForSelection(copy, wordDelimiters);
     }
 }
 
@@ -1001,16 +1034,11 @@ const COORD TextBuffer::_GetWordStartForAccessibility(const COORD target, const 
     COORD result = target;
     const auto bufferSize = GetSize();
     bool stayAtOrigin = false;
-    auto bufferIterator = GetTextDataAt(result);
 
     // ignore left boundary. Continue until readable text found
-    while (_GetDelimiterClass(*bufferIterator, wordDelimiters) != DelimiterClass::RegularChar)
+    while (_GetDelimiterClassAt(result, wordDelimiters) != DelimiterClass::RegularChar)
     {
-        if (bufferSize.DecrementInBounds(result))
-        {
-            --bufferIterator;
-        }
-        else
+        if (!bufferSize.DecrementInBounds(result))
         {
             // first char in buffer is a DelimiterChar or ControlChar
             // we can't move any further back
@@ -1020,13 +1048,9 @@ const COORD TextBuffer::_GetWordStartForAccessibility(const COORD target, const 
     }
 
     // make sure we expand to the left boundary or the beginning of the word
-    while (_GetDelimiterClass(*bufferIterator, wordDelimiters) == DelimiterClass::RegularChar)
+    while (_GetDelimiterClassAt(result, wordDelimiters) == DelimiterClass::RegularChar)
     {
-        if (bufferSize.DecrementInBounds(result))
-        {
-            --bufferIterator;
-        }
-        else
+        if (!bufferSize.DecrementInBounds(result))
         {
             // first char in buffer is a RegularChar
             // we can't move any further back
@@ -1035,7 +1059,7 @@ const COORD TextBuffer::_GetWordStartForAccessibility(const COORD target, const 
     }
 
     // move off of delimiter and onto word start
-    if (!stayAtOrigin && _GetDelimiterClass(*bufferIterator, wordDelimiters) != DelimiterClass::RegularChar)
+    if (!stayAtOrigin && _GetDelimiterClassAt(result, wordDelimiters) != DelimiterClass::RegularChar)
     {
         bufferSize.IncrementInBounds(result);
     }
@@ -1054,17 +1078,16 @@ const COORD TextBuffer::_GetWordStartForSelection(const COORD target, const std:
 {
     COORD result = target;
     const auto bufferSize = GetSize();
-    auto bufferIterator = GetTextDataAt(result);
-    const auto initialDelimiter = _GetDelimiterClass(*bufferIterator, wordDelimiters);
+
+    const auto initialDelimiter = _GetDelimiterClassAt(result, wordDelimiters);
 
     // expand left until we hit the left boundary or a different delimiter class
-    while (result.X > bufferSize.Left() && (_GetDelimiterClass(*bufferIterator, wordDelimiters) == initialDelimiter))
+    while (result.X > bufferSize.Left() && (_GetDelimiterClassAt(result, wordDelimiters) == initialDelimiter))
     {
         bufferSize.DecrementInBounds(result);
-        --bufferIterator;
     }
 
-    if (_GetDelimiterClass(*bufferIterator, wordDelimiters) != initialDelimiter)
+    if (_GetDelimiterClassAt(result, wordDelimiters) != initialDelimiter)
     {
         // move off of delimiter
         bufferSize.IncrementInBounds(result);
@@ -1095,9 +1118,16 @@ const COORD TextBuffer::GetWordEnd(const COORD target, const std::wstring_view w
     //  so the words in the example include ["word   ", "other  "]
     // NOTE: the end anchor (this one) is exclusive, whereas the start anchor (GetWordStart) is inclusive
 
+    // Already at the end. Can't move forward.
+    if (target == GetSize().EndExclusive())
+    {
+        return target;
+    }
+
     if (accessibilityMode)
     {
-        return _GetWordEndForAccessibility(target, wordDelimiters);
+        const auto lastCharPos{ GetLastNonSpaceCharacter() };
+        return _GetWordEndForAccessibility(target, wordDelimiters, lastCharPos);
     }
     else
     {
@@ -1110,37 +1140,39 @@ const COORD TextBuffer::GetWordEnd(const COORD target, const std::wstring_view w
 // Arguments:
 // - target - a COORD on the word you are currently on
 // - wordDelimiters - what characters are we considering for the separation of words
+// - lastCharPos - the position of the last nonspace character in the text buffer (to improve performance)
 // Return Value:
 // - The COORD for the first character of the next readable "word". If no next word, return one past the end of the buffer
-const COORD TextBuffer::_GetWordEndForAccessibility(const COORD target, const std::wstring_view wordDelimiters) const
+const COORD TextBuffer::_GetWordEndForAccessibility(const COORD target, const std::wstring_view wordDelimiters, const COORD lastCharPos) const
 {
     const auto bufferSize = GetSize();
     COORD result = target;
-    auto bufferIterator = GetTextDataAt(result);
+
+    // Check if we're already on/past the last RegularChar
+    if (bufferSize.CompareInBounds(result, lastCharPos, true) >= 0)
+    {
+        return bufferSize.EndExclusive();
+    }
 
     // ignore right boundary. Continue through readable text found
-    while (_GetDelimiterClass(*bufferIterator, wordDelimiters) == DelimiterClass::RegularChar)
+    while (_GetDelimiterClassAt(result, wordDelimiters) == DelimiterClass::RegularChar)
     {
-        if (bufferSize.IncrementInBounds(result, true))
+        if (!bufferSize.IncrementInBounds(result, true))
         {
-            ++bufferIterator;
-        }
-        else
-        {
-            // last char in buffer is a RegularChar
-            // we can't move any further forward
             break;
         }
     }
 
-    // make sure we expand to the beginning of the NEXT word
-    while (_GetDelimiterClass(*bufferIterator, wordDelimiters) != DelimiterClass::RegularChar)
+    // we are already on/past the last RegularChar
+    if (bufferSize.CompareInBounds(result, lastCharPos, true) >= 0)
     {
-        if (bufferSize.IncrementInBounds(result, true))
-        {
-            ++bufferIterator;
-        }
-        else
+        return bufferSize.EndExclusive();
+    }
+
+    // make sure we expand to the beginning of the NEXT word
+    while (_GetDelimiterClassAt(result, wordDelimiters) != DelimiterClass::RegularChar)
+    {
+        if (!bufferSize.IncrementInBounds(result, true))
         {
             // we are at the EndInclusive COORD
             // this signifies that we must include the last char in the buffer
@@ -1162,31 +1194,69 @@ const COORD TextBuffer::_GetWordEndForAccessibility(const COORD target, const st
 const COORD TextBuffer::_GetWordEndForSelection(const COORD target, const std::wstring_view wordDelimiters) const
 {
     const auto bufferSize = GetSize();
-    COORD result = target;
-    auto bufferIterator = GetTextDataAt(result);
 
     // can't expand right
     if (target.X == bufferSize.RightInclusive())
     {
-        return result;
+        return target;
     }
 
-    const auto initialDelimiter = _GetDelimiterClass(*bufferIterator, wordDelimiters);
+    COORD result = target;
+    const auto initialDelimiter = _GetDelimiterClassAt(result, wordDelimiters);
 
     // expand right until we hit the right boundary or a different delimiter class
-    while (result.X < bufferSize.RightInclusive() && (_GetDelimiterClass(*bufferIterator, wordDelimiters) == initialDelimiter))
+    while (result.X < bufferSize.RightInclusive() && (_GetDelimiterClassAt(result, wordDelimiters) == initialDelimiter))
     {
         bufferSize.IncrementInBounds(result);
-        ++bufferIterator;
     }
 
-    if (_GetDelimiterClass(*bufferIterator, wordDelimiters) != initialDelimiter)
+    if (_GetDelimiterClassAt(result, wordDelimiters) != initialDelimiter)
     {
         // move off of delimiter
         bufferSize.DecrementInBounds(result);
     }
 
     return result;
+}
+
+void TextBuffer::_PruneHyperlinks()
+{
+    // Check the old first row for hyperlink references
+    // If there are any, search the entire buffer for the same reference
+    // If the buffer does not contain the same reference, we can remove that hyperlink from our map
+    // This way, obsolete hyperlink references are cleared from our hyperlink map instead of hanging around
+    // Get all the hyperlink references in the row we're erasing
+    auto firstRowRefs = _storage.at(_firstRow).GetAttrRow().GetHyperlinks();
+    if (!firstRowRefs.empty())
+    {
+        const auto total = TotalRowCount();
+        // Loop through all the rows in the buffer except the first row -
+        // we have found all hyperlink references in the first row and put them in refs,
+        // now we need to search the rest of the buffer (i.e. all the rows except the first)
+        // to see if those references are anywhere else
+        for (size_t i = 1; i != total; ++i)
+        {
+            const auto nextRowRefs = GetRowByOffset(i).GetAttrRow().GetHyperlinks();
+            for (auto id : nextRowRefs)
+            {
+                if (firstRowRefs.find(id) != firstRowRefs.end())
+                {
+                    firstRowRefs.erase(id);
+                }
+            }
+            if (firstRowRefs.empty())
+            {
+                // No more hyperlink references left to search for, terminate early
+                break;
+            }
+        }
+    }
+
+    // Now delete obsolete references from our map
+    for (auto hyperlinkReference : firstRowRefs)
+    {
+        RemoveHyperlinkFromMap(hyperlinkReference);
+    }
 }
 
 // Method Description:
@@ -1200,45 +1270,16 @@ const COORD TextBuffer::_GetWordEndForSelection(const COORD target, const std::w
 // - pos - The COORD for the first character on the "word" (inclusive)
 bool TextBuffer::MoveToNextWord(COORD& pos, const std::wstring_view wordDelimiters, COORD lastCharPos) const
 {
-    auto copy = pos;
-    const auto bufferSize = GetSize();
+    // move to the beginning of the next word
+    // NOTE: _GetWordEnd...() returns the exclusive position of the "end of the word"
+    //       This is also the inclusive start of the next word.
+    auto copy{ _GetWordEndForAccessibility(pos, wordDelimiters, lastCharPos) };
 
-    auto text = GetTextDataAt(copy)->data();
-    auto delimiterClass = _GetDelimiterClass(text, wordDelimiters);
-
-    // started on a word, continue until the end of the word
-    while (delimiterClass == DelimiterClass::RegularChar)
-    {
-        if (!bufferSize.IncrementInBounds(copy))
-        {
-            // last char in buffer is a RegularChar
-            // thus there is no next word
-            return false;
-        }
-        text = GetTextDataAt(copy)->data();
-        delimiterClass = _GetDelimiterClass(text, wordDelimiters);
-    }
-
-    // we are already on/past the last RegularChar
-    if (bufferSize.CompareInBounds(copy, lastCharPos) >= 0)
+    if (copy == GetSize().EndExclusive())
     {
         return false;
     }
 
-    // on whitespace, continue until the beginning of the next word
-    while (delimiterClass != DelimiterClass::RegularChar)
-    {
-        if (!bufferSize.IncrementInBounds(copy))
-        {
-            // last char in buffer is a DelimiterChar or ControlChar
-            // there is no next word
-            return false;
-        }
-        text = GetTextDataAt(copy)->data();
-        delimiterClass = _GetDelimiterClass(text, wordDelimiters);
-    }
-
-    // successful move, copy result out
     pos = copy;
     return true;
 }
@@ -1253,90 +1294,238 @@ bool TextBuffer::MoveToNextWord(COORD& pos, const std::wstring_view wordDelimite
 // - pos - The COORD for the first character on the "word" (inclusive)
 bool TextBuffer::MoveToPreviousWord(COORD& pos, std::wstring_view wordDelimiters) const
 {
-    auto copy = pos;
-    auto bufferSize = GetSize();
+    // move to the beginning of the current word
+    auto copy{ GetWordStart(pos, wordDelimiters, true) };
 
-    auto text = GetTextDataAt(copy)->data();
-    auto delimiterClass = _GetDelimiterClass(text, wordDelimiters);
-
-    // started on whitespace/delimiter, continue until the end of the previous word
-    while (delimiterClass != DelimiterClass::RegularChar)
+    if (!GetSize().DecrementInBounds(copy, true))
     {
-        if (!bufferSize.DecrementInBounds(copy))
-        {
-            // first char in buffer is a DelimiterChar or ControlChar
-            // there is no previous word
-            return false;
-        }
-        text = GetTextDataAt(copy)->data();
-        delimiterClass = _GetDelimiterClass(text, wordDelimiters);
+        // can't move behind current word
+        return false;
     }
 
-    // on a word, continue until the beginning of the word
-    while (delimiterClass == DelimiterClass::RegularChar)
-    {
-        if (!bufferSize.DecrementInBounds(copy))
-        {
-            // first char in buffer is a RegularChar
-            // there is no previous word
-            return false;
-        }
-        text = GetTextDataAt(copy)->data();
-        delimiterClass = _GetDelimiterClass(text, wordDelimiters);
-    }
-
-    // successful move, copy result out
-    pos = copy;
+    // move to the beginning of the previous word
+    pos = GetWordStart(copy, wordDelimiters, true);
     return true;
 }
 
 // Method Description:
-// - get delimiter class for buffer cell data
-// - used for double click selection and uia word navigation
+// - Update pos to be the beginning of the current glyph/character. This is used for accessibility
 // Arguments:
-// - cellChar: the char saved to the buffer cell under observation
-// - wordDelimiters: the delimiters defined as a part of the DelimiterClass::DelimiterChar
+// - pos - a COORD on the word you are currently on
+// Return Value:
+// - pos - The COORD for the first cell of the current glyph (inclusive)
+const til::point TextBuffer::GetGlyphStart(const til::point pos) const
+{
+    COORD resultPos = pos;
+    const auto bufferSize = GetSize();
+
+    if (resultPos == bufferSize.EndExclusive())
+    {
+        bufferSize.DecrementInBounds(resultPos, true);
+    }
+
+    if (resultPos != bufferSize.EndExclusive() && GetCellDataAt(resultPos)->DbcsAttr().IsTrailing())
+    {
+        bufferSize.DecrementInBounds(resultPos, true);
+    }
+
+    return resultPos;
+}
+
+// Method Description:
+// - Update pos to be the end of the current glyph/character. This is used for accessibility
+// Arguments:
+// - pos - a COORD on the word you are currently on
+// Return Value:
+// - pos - The COORD for the last cell of the current glyph (exclusive)
+const til::point TextBuffer::GetGlyphEnd(const til::point pos) const
+{
+    COORD resultPos = pos;
+
+    const auto bufferSize = GetSize();
+    if (resultPos != bufferSize.EndExclusive() && GetCellDataAt(resultPos)->DbcsAttr().IsLeading())
+    {
+        bufferSize.IncrementInBounds(resultPos, true);
+    }
+
+    // increment one more time to become exclusive
+    bufferSize.IncrementInBounds(resultPos, true);
+    return resultPos;
+}
+
+// Method Description:
+// - Update pos to be the beginning of the next glyph/character. This is used for accessibility
+// Arguments:
+// - pos - a COORD on the word you are currently on
+// - allowBottomExclusive - allow the nonexistent end-of-buffer cell to be encountered
+// Return Value:
+// - true, if successfully updated pos. False, if we are unable to move (usually due to a buffer boundary)
+// - pos - The COORD for the first cell of the current glyph (inclusive)
+bool TextBuffer::MoveToNextGlyph(til::point& pos, bool allowBottomExclusive) const
+{
+    COORD resultPos = pos;
+    const auto bufferSize = GetSize();
+
+    if (resultPos == GetSize().EndExclusive())
+    {
+        // we're already at the end
+        return false;
+    }
+
+    // try to move. If we can't, we're done.
+    const bool success = bufferSize.IncrementInBounds(resultPos, allowBottomExclusive);
+    if (resultPos != bufferSize.EndExclusive() && GetCellDataAt(resultPos)->DbcsAttr().IsTrailing())
+    {
+        bufferSize.IncrementInBounds(resultPos, allowBottomExclusive);
+    }
+
+    pos = resultPos;
+    return success;
+}
+
+// Method Description:
+// - Update pos to be the beginning of the previous glyph/character. This is used for accessibility
+// Arguments:
+// - pos - a COORD on the word you are currently on
+// Return Value:
+// - true, if successfully updated pos. False, if we are unable to move (usually due to a buffer boundary)
+// - pos - The COORD for the first cell of the previous glyph (inclusive)
+bool TextBuffer::MoveToPreviousGlyph(til::point& pos) const
+{
+    COORD resultPos = pos;
+
+    // try to move. If we can't, we're done.
+    const auto bufferSize = GetSize();
+    const bool success = bufferSize.DecrementInBounds(resultPos, true);
+    if (resultPos != bufferSize.EndExclusive() && GetCellDataAt(resultPos)->DbcsAttr().IsLeading())
+    {
+        bufferSize.DecrementInBounds(resultPos, true);
+    }
+
+    pos = resultPos;
+    return success;
+}
+
+// Method Description:
+// - Determines the line-by-line rectangles based on two COORDs
+// - expands the rectangles to support wide glyphs
+// - used for selection rects and UIA bounding rects
+// Arguments:
+// - start: a corner of the text region of interest (inclusive)
+// - end: the other corner of the text region of interest (inclusive)
+// - blockSelection: when enabled, only get the rectangular text region,
+//                   as opposed to the text extending to the left/right
+//                   buffer margins
 // Return Value:
 // - the delimiter class for the given char
-TextBuffer::DelimiterClass TextBuffer::_GetDelimiterClass(const std::wstring_view cellChar, const std::wstring_view wordDelimiters) const noexcept
+const std::vector<SMALL_RECT> TextBuffer::GetTextRects(COORD start, COORD end, bool blockSelection) const
 {
-    if (cellChar.at(0) <= UNICODE_SPACE)
+    std::vector<SMALL_RECT> textRects;
+
+    const auto bufferSize = GetSize();
+
+    // (0,0) is the top-left of the screen
+    // the physically "higher" coordinate is closer to the top-left
+    // the physically "lower" coordinate is closer to the bottom-right
+    const auto [higherCoord, lowerCoord] = bufferSize.CompareInBounds(start, end) <= 0 ?
+                                               std::make_tuple(start, end) :
+                                               std::make_tuple(end, start);
+
+    const auto textRectSize = base::ClampedNumeric<short>(1) + lowerCoord.Y - higherCoord.Y;
+    textRects.reserve(textRectSize);
+    for (auto row = higherCoord.Y; row <= lowerCoord.Y; row++)
     {
-        return DelimiterClass::ControlChar;
+        SMALL_RECT textRow;
+
+        textRow.Top = row;
+        textRow.Bottom = row;
+
+        if (blockSelection || higherCoord.Y == lowerCoord.Y)
+        {
+            // set the left and right margin to the left-/right-most respectively
+            textRow.Left = std::min(higherCoord.X, lowerCoord.X);
+            textRow.Right = std::max(higherCoord.X, lowerCoord.X);
+        }
+        else
+        {
+            textRow.Left = (row == higherCoord.Y) ? higherCoord.X : bufferSize.Left();
+            textRow.Right = (row == lowerCoord.Y) ? lowerCoord.X : bufferSize.RightInclusive();
+        }
+
+        _ExpandTextRow(textRow);
+        textRects.emplace_back(textRow);
     }
-    else if (wordDelimiters.find(cellChar) != std::wstring_view::npos)
+
+    return textRects;
+}
+
+// Method Description:
+// - Expand the selection row according to include wide glyphs fully
+// - this is particularly useful for box selections (ALT + selection)
+// Arguments:
+// - selectionRow: the selection row to be expanded
+// Return Value:
+// - modifies selectionRow's Left and Right values to expand properly
+void TextBuffer::_ExpandTextRow(SMALL_RECT& textRow) const
+{
+    const auto bufferSize = GetSize();
+
+    // expand left side of rect
+    COORD targetPoint{ textRow.Left, textRow.Top };
+    if (GetCellDataAt(targetPoint)->DbcsAttr().IsTrailing())
     {
-        return DelimiterClass::DelimiterChar;
+        if (targetPoint.X == bufferSize.Left())
+        {
+            bufferSize.IncrementInBounds(targetPoint);
+        }
+        else
+        {
+            bufferSize.DecrementInBounds(targetPoint);
+        }
+        textRow.Left = targetPoint.X;
     }
-    else
+
+    // expand right side of rect
+    targetPoint = { textRow.Right, textRow.Bottom };
+    if (GetCellDataAt(targetPoint)->DbcsAttr().IsLeading())
     {
-        return DelimiterClass::RegularChar;
+        if (targetPoint.X == bufferSize.RightInclusive())
+        {
+            bufferSize.DecrementInBounds(targetPoint);
+        }
+        else
+        {
+            bufferSize.IncrementInBounds(targetPoint);
+        }
+        textRow.Right = targetPoint.X;
     }
 }
 
 // Routine Description:
 // - Retrieves the text data from the selected region and presents it in a clipboard-ready format (given little post-processing).
 // Arguments:
-// - lineSelection - true if entire line is being selected. False otherwise (box selection)
-// - trimTrailingWhitespace - setting flag removes trailing whitespace at the end of each row in selection
-// - selectionRects - the selection regions from which the data will be extracted from the buffer
-// - GetForegroundColor - function used to map TextAttribute to RGB COLORREF for foreground color
-// - GetBackgroundColor - function used to map TextAttribute to RGB COLORREF for foreground color
+// - includeCRLF - inject CRLF pairs to the end of each line
+// - trimTrailingWhitespace - remove the trailing whitespace at the end of each line
+// - textRects - the rectangular regions from which the data will be extracted from the buffer (i.e.: selection rects)
+// - GetAttributeColors - function used to map TextAttribute to RGB COLORREFs. If null, only extract the text.
 // Return Value:
 // - The text, background color, and foreground color data of the selected region of the text buffer.
-const TextBuffer::TextAndColor TextBuffer::GetTextForClipboard(const bool lineSelection,
-                                                               const bool trimTrailingWhitespace,
-                                                               const std::vector<SMALL_RECT>& selectionRects,
-                                                               std::function<COLORREF(TextAttribute&)> GetForegroundColor,
-                                                               std::function<COLORREF(TextAttribute&)> GetBackgroundColor) const
+const TextBuffer::TextAndColor TextBuffer::GetText(const bool includeCRLF,
+                                                   const bool trimTrailingWhitespace,
+                                                   const std::vector<SMALL_RECT>& selectionRects,
+                                                   std::function<std::pair<COLORREF, COLORREF>(const TextAttribute&)> GetAttributeColors) const
 {
     TextAndColor data;
+    const bool copyTextColor = GetAttributeColors != nullptr;
 
     // preallocate our vectors to reduce reallocs
     size_t const rows = selectionRects.size();
     data.text.reserve(rows);
-    data.FgAttr.reserve(rows);
-    data.BkAttr.reserve(rows);
+    if (copyTextColor)
+    {
+        data.FgAttr.reserve(rows);
+        data.BkAttr.reserve(rows);
+    }
 
     // for each row in the selection
     for (UINT i = 0; i < rows; i++)
@@ -1355,24 +1544,30 @@ const TextBuffer::TextAndColor TextBuffer::GetTextForClipboard(const bool lineSe
 
         // preallocate to avoid reallocs
         selectionText.reserve(gsl::narrow<size_t>(highlight.Width()) + 2); // + 2 for \r\n if we munged it
-        selectionFgAttr.reserve(gsl::narrow<size_t>(highlight.Width()) + 2);
-        selectionBkAttr.reserve(gsl::narrow<size_t>(highlight.Width()) + 2);
+        if (copyTextColor)
+        {
+            selectionFgAttr.reserve(gsl::narrow<size_t>(highlight.Width()) + 2);
+            selectionBkAttr.reserve(gsl::narrow<size_t>(highlight.Width()) + 2);
+        }
 
         // copy char data into the string buffer, skipping trailing bytes
         while (it)
         {
             const auto& cell = *it;
-            auto cellData = cell.TextAttr();
-            COLORREF const CellFgAttr = GetForegroundColor(cellData);
-            COLORREF const CellBkAttr = GetBackgroundColor(cellData);
 
             if (!cell.DbcsAttr().IsTrailing())
             {
                 selectionText.append(cell.Chars());
-                for (const wchar_t wch : cell.Chars())
+
+                if (copyTextColor)
                 {
-                    selectionFgAttr.push_back(CellFgAttr);
-                    selectionBkAttr.push_back(CellBkAttr);
+                    const auto cellData = cell.TextAttr();
+                    const auto [CellFgAttr, CellBkAttr] = GetAttributeColors(cellData);
+                    for (const wchar_t wch : cell.Chars())
+                    {
+                        selectionFgAttr.push_back(CellFgAttr);
+                        selectionBkAttr.push_back(CellBkAttr);
+                    }
                 }
             }
 #pragma warning(suppress : 26444)
@@ -1380,35 +1575,41 @@ const TextBuffer::TextAndColor TextBuffer::GetTextForClipboard(const bool lineSe
             it++;
         }
 
-        // trim trailing spaces if SHIFT key not held
+        const bool forcedWrap = GetRowByOffset(iRow).GetCharRow().WasWrapForced();
+
         if (trimTrailingWhitespace)
         {
-            const ROW& Row = GetRowByOffset(iRow);
-
-            // FOR LINE SELECTION ONLY: if the row was wrapped, don't remove the spaces at the end.
-            if (!lineSelection || !Row.GetCharRow().WasWrapForced())
+            // if the row was NOT wrapped...
+            if (!forcedWrap)
             {
+                // remove the spaces at the end (aka trim the trailing whitespace)
                 while (!selectionText.empty() && selectionText.back() == UNICODE_SPACE)
                 {
                     selectionText.pop_back();
-                    selectionFgAttr.pop_back();
-                    selectionBkAttr.pop_back();
+                    if (copyTextColor)
+                    {
+                        selectionFgAttr.pop_back();
+                        selectionBkAttr.pop_back();
+                    }
                 }
             }
+        }
 
-            // apply CR/LF to the end of the final string, unless we're the last line.
-            // a.k.a if we're earlier than the bottom, then apply CR/LF.
-            if (i < selectionRects.size() - 1)
+        // apply CR/LF to the end of the final string, unless we're the last line.
+        // a.k.a if we're earlier than the bottom, then apply CR/LF.
+        if (includeCRLF && i < selectionRects.size() - 1)
+        {
+            // if the row was NOT wrapped...
+            if (!forcedWrap)
             {
-                // FOR LINE SELECTION ONLY: if the row was wrapped, do not apply CR/LF.
-                // a.k.a. if the row was NOT wrapped, then we can assume a CR/LF is proper
-                // always apply \r\n for box selection
-                if (!lineSelection || !GetRowByOffset(iRow).GetCharRow().WasWrapForced())
-                {
-                    COLORREF const Blackness = RGB(0x00, 0x00, 0x00); // cant see CR/LF so just use black FG & BK
+                // then we can assume a CR/LF is proper
+                selectionText.push_back(UNICODE_CARRIAGERETURN);
+                selectionText.push_back(UNICODE_LINEFEED);
 
-                    selectionText.push_back(UNICODE_CARRIAGERETURN);
-                    selectionText.push_back(UNICODE_LINEFEED);
+                if (copyTextColor)
+                {
+                    // cant see CR/LF so just use black FG & BK
+                    COLORREF const Blackness = RGB(0x00, 0x00, 0x00);
                     selectionFgAttr.push_back(Blackness);
                     selectionFgAttr.push_back(Blackness);
                     selectionBkAttr.push_back(Blackness);
@@ -1418,8 +1619,11 @@ const TextBuffer::TextAndColor TextBuffer::GetTextForClipboard(const bool lineSe
         }
 
         data.text.emplace_back(std::move(selectionText));
-        data.FgAttr.emplace_back(std::move(selectionFgAttr));
-        data.BkAttr.emplace_back(std::move(selectionBkAttr));
+        if (copyTextColor)
+        {
+            data.FgAttr.emplace_back(std::move(selectionFgAttr));
+            data.BkAttr.emplace_back(std::move(selectionBkAttr));
+        }
     }
 
     return data;
@@ -1432,10 +1636,12 @@ const TextBuffer::TextAndColor TextBuffer::GetTextForClipboard(const bool lineSe
 // - backgroundColor - default background color for characters, also used in padding
 // - fontHeightPoints - the unscaled font height
 // - fontFaceName - the name of the font used
-// - htmlTitle - value used in title tag of html header. Used to name the application
 // Return Value:
 // - string containing the generated HTML
-std::string TextBuffer::GenHTML(const TextAndColor& rows, const int fontHeightPoints, const std::wstring_view fontFaceName, const COLORREF backgroundColor, const std::string& htmlTitle)
+std::string TextBuffer::GenHTML(const TextAndColor& rows,
+                                const int fontHeightPoints,
+                                const std::wstring_view fontFaceName,
+                                const COLORREF backgroundColor)
 {
     try
     {
@@ -1445,7 +1651,7 @@ std::string TextBuffer::GenHTML(const TextAndColor& rows, const int fontHeightPo
         // HTML boiler plate required for CF_HTML
         // as part of the HTML Clipboard format
         const std::string htmlHeader =
-            "<!DOCTYPE><HTML><HEAD><TITLE>" + htmlTitle + "</TITLE></HEAD><BODY>";
+            "<!DOCTYPE><HTML><HEAD></HEAD><BODY>";
         htmlBuilder << htmlHeader;
 
         htmlBuilder << "<!--StartFragment -->";
@@ -1805,28 +2011,35 @@ std::string TextBuffer::GenRTF(const TextAndColor& rows, const int fontHeightPoi
 // Arguments:
 // - oldBuffer - the text buffer to copy the contents FROM
 // - newBuffer - the text buffer to copy the contents TO
+// - lastCharacterViewport - Optional. If the caller knows that the last
+//   nonspace character is in a particular Viewport, the caller can provide this
+//   parameter as an optimization, as opposed to searching the entire buffer.
+// - positionInfo - Optional. The caller can provide a pair of rows in this
+//   parameter and we'll calculate the position of the _end_ of those rows in
+//   the new buffer. The rows's new value is placed back into this parameter.
 // Return Value:
 // - S_OK if we successfully copied the contents to the new buffer, otherwise an appropriate HRESULT.
-HRESULT TextBuffer::Reflow(TextBuffer& oldBuffer, TextBuffer& newBuffer)
+HRESULT TextBuffer::Reflow(TextBuffer& oldBuffer,
+                           TextBuffer& newBuffer,
+                           const std::optional<Viewport> lastCharacterViewport,
+                           std::optional<std::reference_wrapper<PositionInformation>> positionInfo)
 {
-    Cursor& oldCursor = oldBuffer.GetCursor();
+    const Cursor& oldCursor = oldBuffer.GetCursor();
     Cursor& newCursor = newBuffer.GetCursor();
-    // skip any drawing updates that might occur as we manipulate the new buffer
-    oldCursor.StartDeferDrawing();
-    newCursor.StartDeferDrawing();
 
     // We need to save the old cursor position so that we can
     // place the new cursor back on the equivalent character in
     // the new buffer.
     const COORD cOldCursorPos = oldCursor.GetPosition();
-    const COORD cOldLastChar = oldBuffer.GetLastNonSpaceCharacter();
+    const COORD cOldLastChar = oldBuffer.GetLastNonSpaceCharacter(lastCharacterViewport);
 
-    short const cOldRowsTotal = cOldLastChar.Y + 1;
-    short const cOldColsTotal = oldBuffer.GetSize().Width();
+    const short cOldRowsTotal = cOldLastChar.Y + 1;
+    const short cOldColsTotal = oldBuffer.GetSize().Width();
 
     COORD cNewCursorPos = { 0 };
     bool fFoundCursorPos = false;
-
+    bool foundOldMutable = false;
+    bool foundOldVisible = false;
     HRESULT hr = S_OK;
     // Loop through all the rows of the old buffer and reprint them into the new buffer
     for (short iOldRow = 0; iOldRow < cOldRowsTotal; iOldRow++)
@@ -1886,6 +2099,31 @@ HRESULT TextBuffer::Reflow(TextBuffer& oldBuffer, TextBuffer& newBuffer)
             }
             CATCH_RETURN();
         }
+
+        // If we found the old row that the caller was interested in, set the
+        // out value of that parameter to the cursor's current Y position (the
+        // new location of the _end_ of that row in the buffer).
+        if (positionInfo.has_value())
+        {
+            if (!foundOldMutable)
+            {
+                if (iOldRow >= positionInfo.value().get().mutableViewportTop)
+                {
+                    positionInfo.value().get().mutableViewportTop = newCursor.GetPosition().Y;
+                    foundOldMutable = true;
+                }
+            }
+
+            if (!foundOldVisible)
+            {
+                if (iOldRow >= positionInfo.value().get().visibleViewportTop)
+                {
+                    positionInfo.value().get().visibleViewportTop = newCursor.GetPosition().Y;
+                    foundOldVisible = true;
+                }
+            }
+        }
+
         if (SUCCEEDED(hr))
         {
             // If we didn't have a full row to copy, insert a new
@@ -1950,6 +2188,7 @@ HRESULT TextBuffer::Reflow(TextBuffer& oldBuffer, TextBuffer& newBuffer)
     {
         // Finish copying remaining parameters from the old text buffer to the new one
         newBuffer.CopyProperties(oldBuffer);
+        newBuffer.CopyHyperlinkMaps(oldBuffer);
 
         // If we found where to put the cursor while placing characters into the buffer,
         //   just put the cursor there. Otherwise we have to advance manually.
@@ -2013,8 +2252,106 @@ HRESULT TextBuffer::Reflow(TextBuffer& oldBuffer, TextBuffer& newBuffer)
         newCursor.SetSize(ulSize);
     }
 
-    newCursor.EndDeferDrawing();
-    oldCursor.EndDeferDrawing();
-
     return hr;
+}
+
+// Method Description:
+// - Adds or updates a hyperlink in our hyperlink table
+// Arguments:
+// - The hyperlink URI, the hyperlink id (could be new or old)
+void TextBuffer::AddHyperlinkToMap(std::wstring_view uri, uint16_t id)
+{
+    _hyperlinkMap[id] = uri;
+}
+
+// Method Description:
+// - Retrieves the URI associated with a particular hyperlink ID
+// Arguments:
+// - The hyperlink ID
+// Return Value:
+// - The URI
+std::wstring TextBuffer::GetHyperlinkUriFromId(uint16_t id) const
+{
+    return _hyperlinkMap.at(id);
+}
+
+// Method description:
+// - Provides the hyperlink ID to be assigned as a text attribute, based on the optional custom id provided
+// Arguments:
+// - The user-defined id
+// Return value:
+// - The internal hyperlink ID
+uint16_t TextBuffer::GetHyperlinkId(std::wstring_view params)
+{
+    uint16_t id = 0;
+    if (params.empty())
+    {
+        // no custom id specified, return our internal count
+        id = _currentHyperlinkId;
+        ++_currentHyperlinkId;
+    }
+    else
+    {
+        // assign _currentHyperlinkId if the custom id does not already exist
+        const auto result = _hyperlinkCustomIdMap.emplace(params, _currentHyperlinkId);
+        if (result.second)
+        {
+            // the custom id did not already exist
+            ++_currentHyperlinkId;
+        }
+        id = (*(result.first)).second;
+    }
+    // _currentHyperlinkId could overflow, make sure its not 0
+    if (_currentHyperlinkId == 0)
+    {
+        ++_currentHyperlinkId;
+    }
+    return id;
+}
+
+// Method Description:
+// - Removes a hyperlink from the hyperlink map and the associated
+//   user defined id from the custom id map (if there is one)
+// Arguments:
+// - The ID of the hyperlink to be removed
+void TextBuffer::RemoveHyperlinkFromMap(uint16_t id)
+{
+    _hyperlinkMap.erase(id);
+    for (const auto& customIdPair : _hyperlinkCustomIdMap)
+    {
+        if (customIdPair.second == id)
+        {
+            _hyperlinkCustomIdMap.erase(customIdPair.first);
+            break;
+        }
+    }
+}
+
+// Method Description:
+// - Obtains the custom ID, if there was one, associated with the
+//   uint16_t id of a hyperlink
+// Arguments:
+// - The uint16_t id of the hyperlink
+// Return Value:
+// - The custom ID if there was one, empty string otherwise
+std::wstring TextBuffer::GetCustomIdFromId(uint16_t id) const
+{
+    for (auto customIdPair : _hyperlinkCustomIdMap)
+    {
+        if (customIdPair.second == id)
+        {
+            return customIdPair.first;
+        }
+    }
+    return {};
+}
+
+// Method Description:
+// - Copies the hyperlink/customID maps of the old buffer into this one
+// Arguments:
+// - The other buffer
+void TextBuffer::CopyHyperlinkMaps(const TextBuffer& other)
+{
+    _hyperlinkMap = other._hyperlinkMap;
+    _hyperlinkCustomIdMap = other._hyperlinkCustomIdMap;
 }

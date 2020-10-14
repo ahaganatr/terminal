@@ -103,15 +103,14 @@ public:
     // Scroll needs access to this to quickly rotate around the buffer.
     bool IncrementCircularBuffer(const bool inVtMode = false);
 
-    COORD GetLastNonSpaceCharacter() const;
-    COORD GetLastNonSpaceCharacter(const Microsoft::Console::Types::Viewport viewport) const;
+    COORD GetLastNonSpaceCharacter(std::optional<const Microsoft::Console::Types::Viewport> viewOptional = std::nullopt) const;
 
     Cursor& GetCursor() noexcept;
     const Cursor& GetCursor() const noexcept;
 
     const SHORT GetFirstRowIndex() const noexcept;
 
-    const Microsoft::Console::Types::Viewport GetSize() const;
+    const Microsoft::Console::Types::Viewport GetSize() const noexcept;
 
     void ScrollRows(const SHORT firstRow, const SHORT size, const SHORT delta);
 
@@ -119,7 +118,7 @@ public:
 
     [[nodiscard]] TextAttribute GetCurrentAttributes() const noexcept;
 
-    void SetCurrentAttributes(const TextAttribute currentAttributes) noexcept;
+    void SetCurrentAttributes(const TextAttribute& currentAttributes) noexcept;
 
     void Reset();
 
@@ -135,6 +134,20 @@ public:
     bool MoveToNextWord(COORD& pos, const std::wstring_view wordDelimiters, COORD lastCharPos) const;
     bool MoveToPreviousWord(COORD& pos, const std::wstring_view wordDelimiters) const;
 
+    const til::point GetGlyphStart(const til::point pos) const;
+    const til::point GetGlyphEnd(const til::point pos) const;
+    bool MoveToNextGlyph(til::point& pos, bool allowBottomExclusive = false) const;
+    bool MoveToPreviousGlyph(til::point& pos) const;
+
+    const std::vector<SMALL_RECT> GetTextRects(COORD start, COORD end, bool blockSelection = false) const;
+
+    void AddHyperlinkToMap(std::wstring_view uri, uint16_t id);
+    std::wstring GetHyperlinkUriFromId(uint16_t id) const;
+    uint16_t GetHyperlinkId(std::wstring_view params);
+    void RemoveHyperlinkFromMap(uint16_t id);
+    std::wstring GetCustomIdFromId(uint16_t id) const;
+    void CopyHyperlinkMaps(const TextBuffer& OtherBuffer);
+
     class TextAndColor
     {
     public:
@@ -143,26 +156,35 @@ public:
         std::vector<std::vector<COLORREF>> BkAttr;
     };
 
-    const TextAndColor GetTextForClipboard(const bool lineSelection,
-                                           const bool trimTrailingWhitespace,
-                                           const std::vector<SMALL_RECT>& selectionRects,
-                                           std::function<COLORREF(TextAttribute&)> GetForegroundColor,
-                                           std::function<COLORREF(TextAttribute&)> GetBackgroundColor) const;
+    const TextAndColor GetText(const bool lineSelection,
+                               const bool trimTrailingWhitespace,
+                               const std::vector<SMALL_RECT>& textRects,
+                               std::function<std::pair<COLORREF, COLORREF>(const TextAttribute&)> GetAttributeColors = nullptr) const;
 
     static std::string GenHTML(const TextAndColor& rows,
                                const int fontHeightPoints,
                                const std::wstring_view fontFaceName,
-                               const COLORREF backgroundColor,
-                               const std::string& htmlTitle);
+                               const COLORREF backgroundColor);
 
     static std::string GenRTF(const TextAndColor& rows,
                               const int fontHeightPoints,
                               const std::wstring_view fontFaceName,
                               const COLORREF backgroundColor);
 
-    static HRESULT Reflow(TextBuffer& oldBuffer, TextBuffer& newBuffer);
+    struct PositionInformation
+    {
+        short mutableViewportTop{ 0 };
+        short visibleViewportTop{ 0 };
+    };
+
+    static HRESULT Reflow(TextBuffer& oldBuffer,
+                          TextBuffer& newBuffer,
+                          const std::optional<Microsoft::Console::Types::Viewport> lastCharacterViewport,
+                          std::optional<std::reference_wrapper<PositionInformation>> positionInfo);
 
 private:
+    void _UpdateSize();
+    Microsoft::Console::Types::Viewport _size;
     std::deque<ROW> _storage;
     Cursor _cursor;
 
@@ -173,13 +195,17 @@ private:
     // storage location for glyphs that can't fit into the buffer normally
     UnicodeStorage _unicodeStorage;
 
+    std::unordered_map<uint16_t, std::wstring> _hyperlinkMap;
+    std::unordered_map<std::wstring, uint16_t> _hyperlinkCustomIdMap;
+    uint16_t _currentHyperlinkId;
+
     void _RefreshRowIDs(std::optional<SHORT> newRowWidth);
 
     Microsoft::Console::Render::IRenderTarget& _renderTarget;
 
     void _SetFirstRowIndex(const SHORT FirstRowIndex) noexcept;
 
-    COORD _GetPreviousFromCursor() const;
+    COORD _GetPreviousFromCursor() const noexcept;
 
     void _SetWrapOnCurrentRow();
     void _AdjustWrapOnCurrentRow(const bool fSet);
@@ -193,17 +219,15 @@ private:
     ROW& _GetFirstRow();
     ROW& _GetPrevRowNoWrap(const ROW& row);
 
-    enum class DelimiterClass
-    {
-        ControlChar,
-        DelimiterChar,
-        RegularChar
-    };
-    DelimiterClass _GetDelimiterClass(const std::wstring_view cellChar, const std::wstring_view wordDelimiters) const noexcept;
+    void _ExpandTextRow(SMALL_RECT& selectionRow) const;
+
+    const DelimiterClass _GetDelimiterClassAt(const COORD pos, const std::wstring_view wordDelimiters) const;
     const COORD _GetWordStartForAccessibility(const COORD target, const std::wstring_view wordDelimiters) const;
     const COORD _GetWordStartForSelection(const COORD target, const std::wstring_view wordDelimiters) const;
-    const COORD _GetWordEndForAccessibility(const COORD target, const std::wstring_view wordDelimiters) const;
+    const COORD _GetWordEndForAccessibility(const COORD target, const std::wstring_view wordDelimiters, const COORD lastCharPos) const;
     const COORD _GetWordEndForSelection(const COORD target, const std::wstring_view wordDelimiters) const;
+
+    void _PruneHyperlinks();
 
 #ifdef UNIT_TESTING
     friend class TextBufferTests;

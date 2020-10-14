@@ -42,6 +42,7 @@ namespace Microsoft::Console::Interactivity::Win32
                                        _In_ IRawElementProviderSimple* const pProvider,
                                        _In_ const COORD start,
                                        _In_ const COORD end,
+                                       _In_ bool blockRange = false,
                                        _In_ const std::wstring_view wordDelimiters = DefaultWordDelimiter) noexcept override;
 
         // range from a UiaPoint
@@ -55,7 +56,6 @@ namespace Microsoft::Console::Interactivity::Win32
         IFACEMETHODIMP Clone(_Outptr_result_maybenull_ ITextRangeProvider** ppRetVal) override;
 
     protected:
-        void _ChangeViewport(const SMALL_RECT NewWindow) override;
         void _TranslatePointToScreen(LPPOINT clientPoint) const override;
         void _TranslatePointFromScreen(LPPOINT screenPoint) const override;
 

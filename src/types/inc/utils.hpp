@@ -11,8 +11,18 @@ Author(s):
 - Mike Griese (migrie) 12-Jun-2018
 --*/
 
+#pragma once
+
 namespace Microsoft::Console::Utils
 {
+    // Function Description:
+    // - Returns -1, 0 or +1 to indicate the sign of the passed-in value.
+    template<typename T>
+    constexpr int Sign(T val) noexcept
+    {
+        return (T{ 0 } < val) - (val < T{ 0 });
+    }
+
     bool IsValidHandle(const HANDLE handle) noexcept;
 
     // Function Description:
@@ -33,8 +43,8 @@ namespace Microsoft::Console::Utils
     GUID GuidFromString(const std::wstring wstr);
     GUID CreateGuid();
 
-    std::string ColorToHexString(const COLORREF color);
-    COLORREF ColorFromHexString(const std::string wstr);
+    std::string ColorToHexString(const til::color color);
+    til::color ColorFromHexString(const std::string_view wstr);
 
     void InitializeCampbellColorTable(const gsl::span<COLORREF> table);
     void InitializeCampbellColorTableForConhost(const gsl::span<COLORREF> table);
@@ -85,4 +95,5 @@ namespace Microsoft::Console::Utils
     }
 
     GUID CreateV5Uuid(const GUID& namespaceGuid, const gsl::span<const gsl::byte> name);
+
 }

@@ -32,9 +32,10 @@ HRESULT UiaTextRange::RuntimeClassInitialize(_In_ IUiaData* pData,
                                              _In_ IRawElementProviderSimple* const pProvider,
                                              const COORD start,
                                              const COORD end,
+                                             bool blockRange,
                                              const std::wstring_view wordDelimiters) noexcept
 {
-    return UiaTextRangeBase::RuntimeClassInitialize(pData, pProvider, start, end, wordDelimiters);
+    return UiaTextRangeBase::RuntimeClassInitialize(pData, pProvider, start, end, blockRange, wordDelimiters);
 }
 
 // returns a degenerate text range of the start of the row closest to the y value of point
@@ -74,12 +75,6 @@ IFACEMETHODIMP UiaTextRange::Clone(_Outptr_result_maybenull_ ITextRangeProvider*
     Tracing::s_TraceUia(this, ApiCall::Clone, &apiMsg);*/
 
     return S_OK;
-}
-
-void UiaTextRange::_ChangeViewport(const SMALL_RECT NewWindow)
-{
-    auto provider = static_cast<ScreenInfoUiaProvider*>(_pProvider);
-    provider->ChangeViewport(NewWindow);
 }
 
 void UiaTextRange::_TranslatePointToScreen(LPPOINT clientPoint) const

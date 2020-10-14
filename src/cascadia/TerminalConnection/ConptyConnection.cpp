@@ -3,17 +3,14 @@
 
 #include "pch.h"
 
-// We have to define GSL here, not PCH
-// because TelnetConnection has a conflicting GSL implementation.
-#include <gsl/gsl>
-
 #include "ConptyConnection.h"
 
 #include <windows.h>
+#include <userenv.h>
 
 #include "ConptyConnection.g.cpp"
 
-#include "../../types/inc/Utils.hpp"
+#include "../../types/inc/utils.hpp"
 #include "../../types/inc/Environment.hpp"
 #include "LibraryResources.h"
 
@@ -97,8 +94,11 @@ namespace winrt::Microsoft::Terminal::TerminalConnection::implementation
             environment.clear();
         });
 
-        // Populate the environment map with the current environment.
-        RETURN_IF_FAILED(Utils::UpdateEnvironmentMapW(environment));
+        {
+            const auto newEnvironmentBlock{ Utils::CreateEnvironmentBlock() };
+            // Populate the environment map with the current environment.
+            RETURN_IF_FAILED(Utils::UpdateEnvironmentMapW(environment, newEnvironmentBlock.get()));
+        }
 
         {
             // Convert connection Guid to string and ignore the enclosing '{}'.
@@ -110,9 +110,29 @@ namespace winrt::Microsoft::Terminal::TerminalConnection::implementation
             // Ensure every connection has the unique identifier in the environment.
             environment.insert_or_assign(L"WT_SESSION", guidSubStr.data());
 
-            auto wslEnv = environment[L"WSLENV"]; // We always want to load something, even if it's blank.
+            if (_environment)
+            {
+                // add additional WT env vars like WT_SETTINGS, WT_DEFAULTS and WT_PROFILE_ID
+                for (auto item : _environment)
+                {
+                    auto key = item.Key();
+                    auto value = item.Value();
+
+                    // avoid clobbering WSLENV
+                    if (std::wstring_view{ key } == L"WSLENV")
+                    {
+                        auto current = environment[L"WSLENV"];
+                        value = current + L":" + value;
+                    }
+
+                    environment.insert_or_assign(key.c_str(), value.c_str());
+                }
+            }
+
             // WSLENV is a colon-delimited list of environment variables (+flags) that should appear inside WSL
             // https://devblogs.microsoft.com/commandline/share-environment-vars-between-wsl-and-windows/
+
+            auto wslEnv = environment[L"WSLENV"];
             wslEnv = L"WT_SESSION:" + wslEnv; // prepend WT_SESSION to make sure it's visible inside WSL.
             environment.insert_or_assign(L"WSLENV", wslEnv);
         }
@@ -173,6 +193,7 @@ namespace winrt::Microsoft::Terminal::TerminalConnection::implementation
     ConptyConnection::ConptyConnection(const hstring& commandline,
                                        const hstring& startingDirectory,
                                        const hstring& startingTitle,
+                                       const Windows::Foundation::Collections::IMapView<hstring, hstring>& environment,
                                        const uint32_t initialRows,
                                        const uint32_t initialCols,
                                        const guid& initialGuid) :
@@ -181,6 +202,7 @@ namespace winrt::Microsoft::Terminal::TerminalConnection::implementation
         _commandline{ commandline },
         _startingDirectory{ startingDirectory },
         _startingTitle{ startingTitle },
+        _environment{ environment },
         _guid{ initialGuid },
         _u8State{},
         _u16Str{},
@@ -201,7 +223,7 @@ namespace winrt::Microsoft::Terminal::TerminalConnection::implementation
     try
     {
         const COORD dimensions{ gsl::narrow_cast<SHORT>(_initialCols), gsl::narrow_cast<SHORT>(_initialRows) };
-        THROW_IF_FAILED(_CreatePseudoConsoleAndPipes(dimensions, 0, &_inPipe, &_outPipe, &_hPC));
+        THROW_IF_FAILED(_CreatePseudoConsoleAndPipes(dimensions, PSEUDOCONSOLE_RESIZE_QUIRK | PSEUDOCONSOLE_WIN32_INPUT_MODE, &_inPipe, &_outPipe, &_hPC));
         THROW_IF_FAILED(_LaunchAttachedClient());
 
         _startTime = std::chrono::high_resolution_clock::now();
@@ -246,7 +268,7 @@ namespace winrt::Microsoft::Terminal::TerminalConnection::implementation
         // EXIT POINT
         const auto hr = wil::ResultFromCaughtException();
 
-        winrt::hstring failureText{ wil::str_printf<std::wstring>(RS_(L"ProcessFailedToLaunch").c_str(), gsl::narrow_cast<unsigned int>(hr), _commandline.c_str()) };
+        winrt::hstring failureText{ fmt::format(std::wstring_view{ RS_(L"ProcessFailedToLaunch") }, gsl::narrow_cast<unsigned long>(hr), _commandline) };
         _TerminalOutputHandlers(failureText);
         _transitionToState(ConnectionState::Failed);
 
@@ -262,7 +284,7 @@ namespace winrt::Microsoft::Terminal::TerminalConnection::implementation
     {
         try
         {
-            winrt::hstring exitText{ wil::str_printf<std::wstring>(RS_(L"ProcessExited").c_str(), status) };
+            winrt::hstring exitText{ fmt::format(std::wstring_view{ RS_(L"ProcessExited") }, status) };
             _TerminalOutputHandlers(L"\r\n");
             _TerminalOutputHandlers(exitText);
         }
@@ -272,6 +294,7 @@ namespace winrt::Microsoft::Terminal::TerminalConnection::implementation
     // Method Description:
     // - called when the client application (not necessarily its pty) exits for any reason
     void ConptyConnection::_ClientTerminated() noexcept
+    try
     {
         if (_isStateAtOrBeyond(ConnectionState::Closing))
         {
@@ -299,6 +322,7 @@ namespace winrt::Microsoft::Terminal::TerminalConnection::implementation
 
         _piClient.reset();
     }
+    CATCH_LOG()
 
     void ConptyConnection::WriteInput(hstring const& data)
     {
@@ -327,6 +351,7 @@ namespace winrt::Microsoft::Terminal::TerminalConnection::implementation
     }
 
     void ConptyConnection::Close() noexcept
+    try
     {
         if (_transitionToState(ConnectionState::Closing))
         {
@@ -356,9 +381,14 @@ namespace winrt::Microsoft::Terminal::TerminalConnection::implementation
             _transitionToState(ConnectionState::Closed);
         }
     }
+    CATCH_LOG()
 
     DWORD ConptyConnection::_OutputThread()
     {
+        // Keep us alive until the output thread terminates; the destructor
+        // won't wait for us, and the known exit points _do_.
+        auto strongThis{ get_strong() };
+
         // process the data of the output pipe in a loop
         while (true)
         {
@@ -419,6 +449,25 @@ namespace winrt::Microsoft::Terminal::TerminalConnection::implementation
         }
 
         return 0;
+    }
+
+    // Function Description:
+    // - This function will be called (by C++/WinRT) after the final outstanding reference to
+    //   any given connection instance is released.
+    //   When a client application exits, its termination will wait for the output thread to
+    //   run down. However, because our teardown is somewhat complex, our last reference may
+    //   be owned by the very output thread that the client wait threadpool is blocked on.
+    //   During destruction, we'll try to release any outstanding handles--including the one
+    //   we have to the threadpool wait. As you might imagine, this takes us right to deadlock
+    //   city.
+    //   Deferring the final destruction of the connection to a background thread that can't
+    //   be awaiting our destruction breaks the deadlock.
+    // Arguments:
+    // - connection: the final living reference to an outgoing connection
+    winrt::fire_and_forget ConptyConnection::final_release(std::unique_ptr<ConptyConnection> connection)
+    {
+        co_await winrt::resume_background(); // move to background
+        connection.reset(); // explicitly destruct
     }
 
 }

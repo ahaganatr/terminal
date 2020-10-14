@@ -3,15 +3,15 @@
 
 #include "pch.h"
 #include "Pane.h"
-#include "Profile.h"
-#include "CascadiaSettings.h"
+#include "AppLogic.h"
 
 using namespace winrt::Windows::Foundation;
+using namespace winrt::Windows::Graphics::Display;
 using namespace winrt::Windows::UI;
 using namespace winrt::Windows::UI::Xaml;
 using namespace winrt::Windows::UI::Core;
 using namespace winrt::Windows::UI::Xaml::Media;
-using namespace winrt::Microsoft::Terminal::Settings;
+using namespace winrt::Microsoft::Terminal::Settings::Model;
 using namespace winrt::Microsoft::Terminal::TerminalControl;
 using namespace winrt::Microsoft::Terminal::TerminalConnection;
 using namespace winrt::TerminalApp;
@@ -20,6 +20,15 @@ using namespace TerminalApp;
 static const int PaneBorderSize = 2;
 static const int CombinedPaneBorderSize = 2 * PaneBorderSize;
 static const float Half = 0.50f;
+
+// WARNING: Don't do this! This won't work
+//   Duration duration{ std::chrono::milliseconds{ 200 } };
+// Instead, make a duration from a TimeSpan from the time in millis
+//
+// 200ms was chosen because it's quick enough that it doesn't break your
+// flow, but not too quick to see
+static const int AnimationDurationInMilliseconds = 200;
+static const Duration AnimationDuration = DurationHelper::FromTimeSpan(winrt::Windows::Foundation::TimeSpan(std::chrono::milliseconds(AnimationDurationInMilliseconds)));
 
 winrt::Windows::UI::Xaml::Media::SolidColorBrush Pane::s_focusedBorderBrush = { nullptr };
 winrt::Windows::UI::Xaml::Media::SolidColorBrush Pane::s_unfocusedBorderBrush = { nullptr };
@@ -41,6 +50,10 @@ Pane::Pane(const GUID& profile, const TermControl& control, const bool lastFocus
     {
         _SetupResources();
     }
+
+    // Use the unfocused border color as the pane background, so an actual color
+    // appears behind panes as we animate them sliding in.
+    _root.Background(s_unfocusedBorderBrush);
 
     // Register an event with the control to have it inform us when it gains focus.
     _gotFocusRevoker = control.GotFocus(winrt::auto_revoke, { this, &Pane::_ControlGotFocusHandler });
@@ -70,7 +83,7 @@ void Pane::ResizeContent(const Size& newSize)
     const auto width = newSize.Width;
     const auto height = newSize.Height;
 
-    _CreateRowColDefinitions(newSize);
+    _CreateRowColDefinitions();
 
     if (_splitState == SplitState::Vertical)
     {
@@ -319,15 +332,15 @@ void Pane::_ControlConnectionStateChangedHandler(const TermControl& /*sender*/, 
         return;
     }
 
-    const auto& settings = CascadiaSettings::GetCurrentAppSettings();
+    const auto settings{ winrt::TerminalApp::implementation::AppLogic::CurrentAppSettings() };
     auto paneProfile = settings.FindProfile(_profile.value());
     if (paneProfile)
     {
-        auto mode = paneProfile->GetCloseOnExitMode();
+        auto mode = paneProfile.CloseOnExit();
         if ((mode == CloseOnExitMode::Always) ||
             (mode == CloseOnExitMode::Graceful && newConnectionState == ConnectionState::Closed))
         {
-            _ClosedHandlers(nullptr, nullptr);
+            Close();
         }
     }
 }
@@ -761,7 +774,129 @@ winrt::fire_and_forget Pane::_CloseChildRoutine(const bool closeFirst)
 
     if (auto pane{ weakThis.get() })
     {
-        _CloseChild(closeFirst);
+        // This will query if animations are enabled via the "Show animations in
+        // Windows" setting in the OS
+        winrt::Windows::UI::ViewManagement::UISettings uiSettings;
+        const auto animationsEnabledInOS = uiSettings.AnimationsEnabled();
+        const auto animationsEnabledInApp = Media::Animation::Timeline::AllowDependentAnimations();
+
+        // If animations are disabled, just skip this and go straight to
+        // _CloseChild. Curiously, the pane opening animation doesn't need this,
+        // and will skip straight to Completed when animations are disabled, but
+        // this one doesn't seem to.
+        if (!animationsEnabledInOS || !animationsEnabledInApp)
+        {
+            pane->_CloseChild(closeFirst);
+            co_return;
+        }
+
+        // Setup the animation
+
+        auto removedChild = closeFirst ? _firstChild : _secondChild;
+        auto remainingChild = closeFirst ? _secondChild : _firstChild;
+        const bool splitWidth = _splitState == SplitState::Vertical;
+        const auto totalSize = splitWidth ? _root.ActualWidth() : _root.ActualHeight();
+
+        Size removedOriginalSize{
+            ::base::saturated_cast<float>(removedChild->_root.ActualWidth()),
+            ::base::saturated_cast<float>(removedChild->_root.ActualHeight())
+        };
+        Size remainingOriginalSize{
+            ::base::saturated_cast<float>(remainingChild->_root.ActualWidth()),
+            ::base::saturated_cast<float>(remainingChild->_root.ActualHeight())
+        };
+
+        // Remove both children from the grid
+        _root.Children().Clear();
+        // Add the remaining child back to the grid, in the right place.
+        _root.Children().Append(remainingChild->GetRootElement());
+        if (_splitState == SplitState::Vertical)
+        {
+            Controls::Grid::SetColumn(remainingChild->GetRootElement(), closeFirst ? 1 : 0);
+        }
+        else if (_splitState == SplitState::Horizontal)
+        {
+            Controls::Grid::SetRow(remainingChild->GetRootElement(), closeFirst ? 1 : 0);
+        }
+
+        // Create the dummy grid. This grid will be the one we actually animate,
+        // in the place of the closed pane.
+        Controls::Grid dummyGrid;
+        dummyGrid.Background(s_unfocusedBorderBrush);
+        // It should be the size of the closed pane.
+        dummyGrid.Width(removedOriginalSize.Width);
+        dummyGrid.Height(removedOriginalSize.Height);
+        // Put it where the removed child is
+        if (_splitState == SplitState::Vertical)
+        {
+            Controls::Grid::SetColumn(dummyGrid, closeFirst ? 0 : 1);
+        }
+        else if (_splitState == SplitState::Horizontal)
+        {
+            Controls::Grid::SetRow(dummyGrid, closeFirst ? 0 : 1);
+        }
+        // Add it to the tree
+        _root.Children().Append(dummyGrid);
+
+        // Set up the rows/cols as auto/auto, so they'll only use the size of
+        // the elements in the grid.
+        //
+        // * For the closed pane, we want to make that row/col "auto" sized, so
+        //   it takes up as much space as is available.
+        // * For the remaining pane, we'll make that row/col "*" sized, so it
+        //   takes all the remaining space. As the dummy grid is resized down,
+        //   the remaining pane will expand to take the rest of the space.
+        _root.ColumnDefinitions().Clear();
+        _root.RowDefinitions().Clear();
+        if (_splitState == SplitState::Vertical)
+        {
+            auto firstColDef = Controls::ColumnDefinition();
+            auto secondColDef = Controls::ColumnDefinition();
+            firstColDef.Width(!closeFirst ? GridLengthHelper::FromValueAndType(1, GridUnitType::Star) : GridLengthHelper::Auto());
+            secondColDef.Width(closeFirst ? GridLengthHelper::FromValueAndType(1, GridUnitType::Star) : GridLengthHelper::Auto());
+            _root.ColumnDefinitions().Append(firstColDef);
+            _root.ColumnDefinitions().Append(secondColDef);
+        }
+        else if (_splitState == SplitState::Horizontal)
+        {
+            auto firstRowDef = Controls::RowDefinition();
+            auto secondRowDef = Controls::RowDefinition();
+            firstRowDef.Height(!closeFirst ? GridLengthHelper::FromValueAndType(1, GridUnitType::Star) : GridLengthHelper::Auto());
+            secondRowDef.Height(closeFirst ? GridLengthHelper::FromValueAndType(1, GridUnitType::Star) : GridLengthHelper::Auto());
+            _root.RowDefinitions().Append(firstRowDef);
+            _root.RowDefinitions().Append(secondRowDef);
+        }
+
+        // Animate the dummy grid from its current size down to 0
+        Media::Animation::DoubleAnimation animation{};
+        animation.Duration(AnimationDuration);
+        animation.From(splitWidth ? removedOriginalSize.Width : removedOriginalSize.Height);
+        animation.To(0.0);
+        // This easing is the same as the entrance animation.
+        animation.EasingFunction(Media::Animation::QuadraticEase{});
+        animation.EnableDependentAnimation(true);
+
+        Media::Animation::Storyboard s;
+        s.Duration(AnimationDuration);
+        s.Children().Append(animation);
+        s.SetTarget(animation, dummyGrid);
+        s.SetTargetProperty(animation, splitWidth ? L"Width" : L"Height");
+
+        // Start the animation.
+        s.Begin();
+
+        std::weak_ptr<Pane> weakThis{ shared_from_this() };
+
+        // When the animation is completed, reparent the child's content up to
+        // us, and remove the child nodes from the tree.
+        animation.Completed([weakThis, closeFirst](auto&&, auto&&) {
+            if (auto pane{ weakThis.lock() })
+            {
+                // We don't need to manually undo any of the above trickiness.
+                // We're going to re-parent the child's content into us anyways
+                pane->_CloseChild(closeFirst);
+            }
+        });
     }
 }
 
@@ -790,23 +925,24 @@ void Pane::_SetupChildCloseHandlers()
 //   which is stored in _desiredSplitPosition
 // - Does nothing if our split state is currently set to SplitState::None
 // Arguments:
-// - rootSize: The dimensions in pixels that this pane (and its children should consume.)
+// - <none>
 // Return Value:
 // - <none>
-void Pane::_CreateRowColDefinitions(const Size& rootSize)
+void Pane::_CreateRowColDefinitions()
 {
+    const auto first = _desiredSplitPosition * 100.0f;
+    const auto second = 100.0f - first;
     if (_splitState == SplitState::Vertical)
     {
         _root.ColumnDefinitions().Clear();
 
         // Create two columns in this grid: one for each pane
-        const auto paneSizes = _CalcChildrenSizes(rootSize.Width);
 
         auto firstColDef = Controls::ColumnDefinition();
-        firstColDef.Width(GridLengthHelper::FromPixels(paneSizes.first));
+        firstColDef.Width(GridLengthHelper::FromValueAndType(first, GridUnitType::Star));
 
         auto secondColDef = Controls::ColumnDefinition();
-        secondColDef.Width(GridLengthHelper::FromPixels(paneSizes.second));
+        secondColDef.Width(GridLengthHelper::FromValueAndType(second, GridUnitType::Star));
 
         _root.ColumnDefinitions().Append(firstColDef);
         _root.ColumnDefinitions().Append(secondColDef);
@@ -816,33 +952,16 @@ void Pane::_CreateRowColDefinitions(const Size& rootSize)
         _root.RowDefinitions().Clear();
 
         // Create two rows in this grid: one for each pane
-        const auto paneSizes = _CalcChildrenSizes(rootSize.Height);
 
         auto firstRowDef = Controls::RowDefinition();
-        firstRowDef.Height(GridLengthHelper::FromPixels(paneSizes.first));
+        firstRowDef.Height(GridLengthHelper::FromValueAndType(first, GridUnitType::Star));
 
         auto secondRowDef = Controls::RowDefinition();
-        secondRowDef.Height(GridLengthHelper::FromPixels(paneSizes.second));
+        secondRowDef.Height(GridLengthHelper::FromValueAndType(second, GridUnitType::Star));
 
         _root.RowDefinitions().Append(firstRowDef);
         _root.RowDefinitions().Append(secondRowDef);
     }
-}
-
-// Method Description:
-// - Initializes our UI for a new split in this pane. Sets up row/column
-//   definitions, and initializes the separator grid. Does nothing if our split
-//   state is currently set to SplitState::None
-// Arguments:
-// - <none>
-// Return Value:
-// - <none>
-void Pane::_CreateSplitContent()
-{
-    Size actualSize{ gsl::narrow_cast<float>(_root.ActualWidth()),
-                     gsl::narrow_cast<float>(_root.ActualHeight()) };
-
-    _CreateRowColDefinitions(actualSize);
 }
 
 // Method Description:
@@ -856,21 +975,29 @@ void Pane::_UpdateBorders()
     double top = 0, bottom = 0, left = 0, right = 0;
 
     Thickness newBorders{ 0 };
-    if (WI_IsFlagSet(_borders, Borders::Top))
+    if (_zoomed)
     {
-        top = PaneBorderSize;
+        // When the pane is zoomed, manually show all the borders around the window.
+        top = bottom = right = left = PaneBorderSize;
     }
-    if (WI_IsFlagSet(_borders, Borders::Bottom))
+    else
     {
-        bottom = PaneBorderSize;
-    }
-    if (WI_IsFlagSet(_borders, Borders::Left))
-    {
-        left = PaneBorderSize;
-    }
-    if (WI_IsFlagSet(_borders, Borders::Right))
-    {
-        right = PaneBorderSize;
+        if (WI_IsFlagSet(_borders, Borders::Top))
+        {
+            top = PaneBorderSize;
+        }
+        if (WI_IsFlagSet(_borders, Borders::Bottom))
+        {
+            bottom = PaneBorderSize;
+        }
+        if (WI_IsFlagSet(_borders, Borders::Left))
+        {
+            left = PaneBorderSize;
+        }
+        if (WI_IsFlagSet(_borders, Borders::Right))
+        {
+            right = PaneBorderSize;
+        }
     }
     _border.BorderThickness(ThicknessHelper::FromLengths(left, top, right, bottom));
 }
@@ -912,6 +1039,140 @@ void Pane::_ApplySplitDefinitions()
 }
 
 // Method Description:
+// - Create a pair of animations when a new control enters this pane. This
+//   should _ONLY_ be called in _Split, AFTER the first and second child panes
+//   have been set up.
+void Pane::_SetupEntranceAnimation()
+{
+    // This will query if animations are enabled via the "Show animations in
+    // Windows" setting in the OS
+    winrt::Windows::UI::ViewManagement::UISettings uiSettings;
+    const auto animationsEnabledInOS = uiSettings.AnimationsEnabled();
+
+    const bool splitWidth = _splitState == SplitState::Vertical;
+    const auto totalSize = splitWidth ? _root.ActualWidth() : _root.ActualHeight();
+    // If we don't have a size yet, it's likely that we're in startup, or we're
+    // being executed as a sequence of actions. In that case, just skip the
+    // animation.
+    if (totalSize <= 0 || !animationsEnabledInOS)
+    {
+        return;
+    }
+
+    const auto [firstSize, secondSize] = _CalcChildrenSizes(::base::saturated_cast<float>(totalSize));
+
+    // This is safe to capture this, because it's only being called in the
+    // context of this method (not on another thread)
+    auto setupAnimation = [&](const auto& size, const bool isFirstChild) {
+        auto child = isFirstChild ? _firstChild : _secondChild;
+        auto childGrid = child->_root;
+        auto control = child->_control;
+        // Build up our animation:
+        // * it'll take as long as our duration (200ms)
+        // * it'll change the value of our property from 0 to secondSize
+        // * it'll animate that value using a quadratic function (like f(t) = t^2)
+        // * IMPORTANT! We'll manually tell the animation that "yes we know what
+        //   we're doing, we want an animation here."
+        Media::Animation::DoubleAnimation animation{};
+        animation.Duration(AnimationDuration);
+        if (isFirstChild)
+        {
+            // If we're animating the first pane, the size should decrease, from
+            // the full size down to the given size.
+            animation.From(totalSize);
+            animation.To(size);
+        }
+        else
+        {
+            // Otherwise, we want to show the pane getting larger, so animate
+            // from 0 to the requested size.
+            animation.From(0.0);
+            animation.To(size);
+        }
+        animation.EasingFunction(Media::Animation::QuadraticEase{});
+        animation.EnableDependentAnimation(true);
+
+        // Now we're going to set up the Storyboard. This is a unit that uses the
+        // Animation from above, and actually applies it to a property.
+        // * we'll set it up for the same duration as the animation we have
+        // * Apply the animation to the grid of the new pane we're adding to the tree.
+        // * apply the animation to the Width or Height property.
+        Media::Animation::Storyboard s;
+        s.Duration(AnimationDuration);
+        s.Children().Append(animation);
+        s.SetTarget(animation, childGrid);
+        s.SetTargetProperty(animation, splitWidth ? L"Width" : L"Height");
+
+        // BE TRICKY:
+        // We're animating the width or height of our child pane's grid.
+        //
+        // We DON'T want to change the size of the control itself, because the
+        // terminal has to reflow the buffer every time the control changes size. So
+        // what we're going to do there is manually set the control's size to how
+        // big we _actually know_ the control will be.
+        //
+        // We're also going to be changing alignment of our child pane and the
+        // control. This way, we'll be able to have the control stick to the inside
+        // of the child pane's grid (the side that's moving), while we also have the
+        // pane's grid stick to "outside" of the grid (the side that's not moving)
+        if (splitWidth)
+        {
+            // If we're animating the first child, then stick to the top/left of
+            // the parent pane, otherwise use the bottom/right. This is always
+            // the "outside" of the parent pane.
+            childGrid.HorizontalAlignment(isFirstChild ? HorizontalAlignment::Left : HorizontalAlignment::Right);
+            control.HorizontalAlignment(HorizontalAlignment::Left);
+            control.Width(isFirstChild ? totalSize : size);
+        }
+        else
+        {
+            // If we're animating the first child, then stick to the top/left of
+            // the parent pane, otherwise use the bottom/right. This is always
+            // the "outside" of the parent pane.
+            childGrid.VerticalAlignment(isFirstChild ? VerticalAlignment::Top : VerticalAlignment::Bottom);
+            control.VerticalAlignment(VerticalAlignment::Top);
+            control.Height(isFirstChild ? totalSize : size);
+        }
+
+        // Start the animation.
+        s.Begin();
+
+        std::weak_ptr<Pane> weakThis{ shared_from_this() };
+        // When the animation is completed, undo the trickiness from before, to
+        // restore the controls to the behavior they'd usually have.
+        animation.Completed([weakThis, isFirstChild, splitWidth](auto&&, auto&&) {
+            if (auto pane{ weakThis.lock() })
+            {
+                auto child = isFirstChild ? pane->_firstChild : pane->_secondChild;
+                auto childGrid = child->_root;
+                if (auto control = child->_control)
+                {
+                    if (splitWidth)
+                    {
+                        control.Width(NAN);
+                        childGrid.Width(NAN);
+                        childGrid.HorizontalAlignment(HorizontalAlignment::Stretch);
+                        control.HorizontalAlignment(HorizontalAlignment::Stretch);
+                    }
+                    else
+                    {
+                        control.Height(NAN);
+                        childGrid.Height(NAN);
+                        childGrid.VerticalAlignment(VerticalAlignment::Stretch);
+                        control.VerticalAlignment(VerticalAlignment::Stretch);
+                    }
+                }
+            }
+        });
+    };
+
+    // TODO: GH#7365 - animating the first child right now doesn't _really_ do
+    // anything. We could do better though.
+    setupAnimation(firstSize, true);
+    setupAnimation(secondSize, false);
+}
+
+// Method Description:
 // - Determines whether the pane can be split
 // Arguments:
 // - splitType: what type of split we want to create.
@@ -935,6 +1196,102 @@ bool Pane::CanSplit(SplitState splitType)
     }
 
     return false;
+}
+
+// Method Description:
+// - This is a helper to determine if a given Pane can be split, but without
+//   using the ActualWidth() and ActualHeight() methods. This is used during
+//   processing of many "split-pane" commands, which could happen _before_ we've
+//   laid out a Pane for the first time. When this happens, the Pane's don't
+//   have an actual size yet. However, we'd still like to figure out if the pane
+//   could be split, once they're all laid out.
+// - This method assumes that the Pane we're attempting to split is `target`,
+//   and this method should be called on the root of a tree of Panes.
+// - We'll walk down the tree attempting to find `target`. As we traverse the
+//   tree, we'll reduce the size passed to each subsequent recursive call. The
+//   size passed to this method represents how much space this Pane _will_ have
+//   to use.
+//   * If this pane is a leaf, and it's the pane we're looking for, use the
+//     available space to calculate which direction to split in.
+//   * If this pane is _any other leaf_, then just return nullopt, to indicate
+//     that the `target` Pane is not down this branch.
+//   * If this pane is a parent, calculate how much space our children will be
+//     able to use, and recurse into them.
+// Arguments:
+// - target: The Pane we're attempting to split.
+// - splitType: The direction we're attempting to split in.
+// - availableSpace: The theoretical space that's available for this pane to be able to split.
+// Return Value:
+// - nullopt if `target` is not this pane or a child of this pane, otherwise
+//   true iff we could split this pane, given `availableSpace`
+// Note:
+// - This method is highly similar to Pane::PreCalculateAutoSplit
+std::optional<bool> Pane::PreCalculateCanSplit(const std::shared_ptr<Pane> target,
+                                               SplitState splitType,
+                                               const winrt::Windows::Foundation::Size availableSpace) const
+{
+    if (_IsLeaf())
+    {
+        if (target.get() == this)
+        {
+            // If this pane is a leaf, and it's the pane we're looking for, use
+            // the available space to calculate which direction to split in.
+            const Size minSize = _GetMinSize();
+
+            if (splitType == SplitState::None)
+            {
+                return { false };
+            }
+
+            else if (splitType == SplitState::Vertical)
+            {
+                const auto widthMinusSeparator = availableSpace.Width - CombinedPaneBorderSize;
+                const auto newWidth = widthMinusSeparator * Half;
+
+                return { newWidth > minSize.Width };
+            }
+
+            else if (splitType == SplitState::Horizontal)
+            {
+                const auto heightMinusSeparator = availableSpace.Height - CombinedPaneBorderSize;
+                const auto newHeight = heightMinusSeparator * Half;
+
+                return { newHeight > minSize.Height };
+            }
+        }
+        else
+        {
+            // If this pane is _any other leaf_, then just return nullopt, to
+            // indicate that the `target` Pane is not down this branch.
+            return std::nullopt;
+        }
+    }
+    else
+    {
+        // If this pane is a parent, calculate how much space our children will
+        // be able to use, and recurse into them.
+
+        const bool isVerticalSplit = _splitState == SplitState::Vertical;
+        const float firstWidth = isVerticalSplit ?
+                                     (availableSpace.Width * _desiredSplitPosition) - PaneBorderSize :
+                                     availableSpace.Width;
+        const float secondWidth = isVerticalSplit ?
+                                      (availableSpace.Width - firstWidth) - PaneBorderSize :
+                                      availableSpace.Width;
+        const float firstHeight = !isVerticalSplit ?
+                                      (availableSpace.Height * _desiredSplitPosition) - PaneBorderSize :
+                                      availableSpace.Height;
+        const float secondHeight = !isVerticalSplit ?
+                                       (availableSpace.Height - firstHeight) - PaneBorderSize :
+                                       availableSpace.Height;
+
+        const auto firstResult = _firstChild->PreCalculateCanSplit(target, splitType, { firstWidth, firstHeight });
+        return firstResult.has_value() ? firstResult : _secondChild->PreCalculateCanSplit(target, splitType, { secondWidth, secondHeight });
+    }
+
+    // We should not possibly be getting here - both the above branches should
+    // return a value.
+    FAIL_FAST();
 }
 
 // Method Description:
@@ -1077,7 +1434,7 @@ std::pair<std::shared_ptr<Pane>, std::shared_ptr<Pane>> Pane::_Split(SplitState 
     _control = { nullptr };
     _secondChild = std::make_shared<Pane>(profile, control);
 
-    _CreateSplitContent();
+    _CreateRowColDefinitions();
 
     _root.Children().Append(_firstChild->GetRootElement());
     _root.Children().Append(_secondChild->GetRootElement());
@@ -1089,7 +1446,79 @@ std::pair<std::shared_ptr<Pane>, std::shared_ptr<Pane>> Pane::_Split(SplitState 
 
     _lastActive = false;
 
+    _SetupEntranceAnimation();
+
     return { _firstChild, _secondChild };
+}
+
+// Method Description:
+// - Recursively attempt to "zoom" the given pane. When the pane is zoomed, it
+//   won't be displayed as part of the tab tree, instead it'll take up the full
+//   content of the tab. When we find the given pane, we'll need to remove it
+//   from the UI tree, so that the caller can re-add it. We'll also set some
+//   internal state, so the pane can display all of its borders.
+// Arguments:
+// - zoomedPane: This is the pane which we're attempting to zoom on.
+// Return Value:
+// - <none>
+void Pane::Maximize(std::shared_ptr<Pane> zoomedPane)
+{
+    if (_IsLeaf())
+    {
+        _zoomed = (zoomedPane == shared_from_this());
+        _UpdateBorders();
+    }
+    else
+    {
+        if (zoomedPane == _firstChild || zoomedPane == _secondChild)
+        {
+            // When we're zooming the pane, we'll need to remove it from our UI
+            // tree. Easy way: just remove both children. We'll re-attach both
+            // when we un-zoom.
+            _root.Children().Clear();
+        }
+
+        // Always recurse into both children. If the (un)zoomed pane was one of
+        // our direct children, we'll still want to update it's borders.
+        _firstChild->Maximize(zoomedPane);
+        _secondChild->Maximize(zoomedPane);
+    }
+}
+
+// Method Description:
+// - Recursively attempt to "un-zoom" the given pane. This does the opposite of
+//   Pane::Maximize. When we find the given pane, we should return the pane to our
+//   UI tree. We'll also clear the internal state, so the pane can display its
+//   borders correctly.
+// - The caller should make sure to have removed the zoomed pane from the UI
+//   tree _before_ calling this.
+// Arguments:
+// - zoomedPane: This is the pane which we're attempting to un-zoom.
+// Return Value:
+// - <none>
+void Pane::Restore(std::shared_ptr<Pane> zoomedPane)
+{
+    if (_IsLeaf())
+    {
+        _zoomed = false;
+        _UpdateBorders();
+    }
+    else
+    {
+        if (zoomedPane == _firstChild || zoomedPane == _secondChild)
+        {
+            // When we're un-zooming the pane, we'll need to re-add it to our UI
+            // tree where it originally belonged. easy way: just re-add both.
+            _root.Children().Clear();
+            _root.Children().Append(_firstChild->GetRootElement());
+            _root.Children().Append(_secondChild->GetRootElement());
+        }
+
+        // Always recurse into both children. If the (un)zoomed pane was one of
+        // our direct children, we'll still want to update it's borders.
+        _firstChild->Restore(zoomedPane);
+        _secondChild->Restore(zoomedPane);
+    }
 }
 
 // Method Description:
@@ -1281,7 +1710,7 @@ Pane::SnapSizeResult Pane::_CalcSnappedDimension(const bool widthOrHeight, const
 //   already snapped or minimum size.
 // Arguments:
 // - widthOrHeight: if true operates on width, otherwise on height.
-// - sizeNode: a layouting node that corresponds to this pane.
+// - sizeNode: a layout size node that corresponds to this pane.
 // Return Value:
 // - <none>
 void Pane::_AdvanceSnappedDimension(const bool widthOrHeight, LayoutSizeNode& sizeNode) const
@@ -1520,6 +1949,76 @@ void Pane::_SetupResources()
         // will eat focus.
         s_unfocusedBorderBrush = SolidColorBrush{ Colors::Black() };
     }
+}
+
+int Pane::GetLeafPaneCount() const noexcept
+{
+    return _IsLeaf() ? 1 : (_firstChild->GetLeafPaneCount() + _secondChild->GetLeafPaneCount());
+}
+
+// Method Description:
+// - This is a helper to determine which direction an "Automatic" split should
+//   happen in for a given pane, but without using the ActualWidth() and
+//   ActualHeight() methods. This is used during the initialization of the
+//   Terminal, when we could be processing many "split-pane" commands _before_
+//   we've ever laid out the Terminal for the first time. When this happens, the
+//   Pane's don't have an actual size yet. However, we'd still like to figure
+//   out how to do an "auto" split when these Panes are all laid out.
+// - This method assumes that the Pane we're attempting to split is `target`,
+//   and this method should be called on the root of a tree of Panes.
+// - We'll walk down the tree attempting to find `target`. As we traverse the
+//   tree, we'll reduce the size passed to each subsequent recursive call. The
+//   size passed to this method represents how much space this Pane _will_ have
+//   to use.
+//   * If this pane is a leaf, and it's the pane we're looking for, use the
+//     available space to calculate which direction to split in.
+//   * If this pane is _any other leaf_, then just return nullopt, to indicate
+//     that the `target` Pane is not down this branch.
+//   * If this pane is a parent, calculate how much space our children will be
+//     able to use, and recurse into them.
+// Arguments:
+// - target: The Pane we're attempting to split.
+// - availableSpace: The theoretical space that's available for this pane to be able to split.
+// Return Value:
+// - nullopt if `target` is not this pane or a child of this pane, otherwise the
+//   SplitState that `target` would use for an `Automatic` split given
+//   `availableSpace`
+std::optional<SplitState> Pane::PreCalculateAutoSplit(const std::shared_ptr<Pane> target,
+                                                      const winrt::Windows::Foundation::Size availableSpace) const
+{
+    if (_IsLeaf())
+    {
+        if (target.get() == this)
+        {
+            //If this pane is a leaf, and it's the pane we're looking for, use
+            //the available space to calculate which direction to split in.
+            return availableSpace.Width > availableSpace.Height ? SplitState::Vertical : SplitState::Horizontal;
+        }
+        else
+        {
+            // If this pane is _any other leaf_, then just return nullopt, to
+            // indicate that the `target` Pane is not down this branch.
+            return std::nullopt;
+        }
+    }
+    else
+    {
+        // If this pane is a parent, calculate how much space our children will
+        // be able to use, and recurse into them.
+
+        const bool isVerticalSplit = _splitState == SplitState::Vertical;
+        const float firstWidth = isVerticalSplit ? (availableSpace.Width * _desiredSplitPosition) : availableSpace.Width;
+        const float secondWidth = isVerticalSplit ? (availableSpace.Width - firstWidth) : availableSpace.Width;
+        const float firstHeight = !isVerticalSplit ? (availableSpace.Height * _desiredSplitPosition) : availableSpace.Height;
+        const float secondHeight = !isVerticalSplit ? (availableSpace.Height - firstHeight) : availableSpace.Height;
+
+        const auto firstResult = _firstChild->PreCalculateAutoSplit(target, { firstWidth, firstHeight });
+        return firstResult.has_value() ? firstResult : _secondChild->PreCalculateAutoSplit(target, { secondWidth, secondHeight });
+    }
+
+    // We should not possibly be getting here - both the above branches should
+    // return a value.
+    FAIL_FAST();
 }
 
 DEFINE_EVENT(Pane, GotFocus, _GotFocusHandlers, winrt::delegate<std::shared_ptr<Pane>>);
